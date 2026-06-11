@@ -59,15 +59,34 @@ class RobomimicImageWrapper(gym.Env):
         self.observation_space = observation_space
 
 
+    @staticmethod
+    def _to_chw_float(img: np.ndarray) -> np.ndarray:
+        """Normalize an image obs to (C, H, W) float32 in [0, 1].
+
+        robomimic <=0.2 returned processed CHW float images; >=0.3 returns raw
+        HWC uint8. Accept both so the wrapper works across versions.
+        """
+        if img.ndim == 3 and img.shape[-1] in (1, 3) and img.shape[0] not in (1, 3):
+            img = np.moveaxis(img, -1, 0)
+        if img.dtype == np.uint8:
+            img = img.astype(np.float32) / 255.0
+        return img
+
     def get_observation(self, raw_obs=None):
         if raw_obs is None:
             raw_obs = self.env.get_observation()
-        
-        self.render_cache = raw_obs[self.render_obs_key]
 
         obs = dict()
         for key in self.observation_space.keys():
-            obs[key] = raw_obs[key]
+            this_obs = raw_obs[key]
+            if key.endswith('image'):
+                this_obs = self._to_chw_float(this_obs)
+            obs[key] = this_obs
+
+        self.render_cache = obs.get(
+            self.render_obs_key,
+            self._to_chw_float(raw_obs[self.render_obs_key]),
+        )
         return obs
 
     def seed(self, seed=None):

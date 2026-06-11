@@ -412,6 +412,16 @@ def main() -> None:
     runner_cfg.test_start_seed = args.seed
     if args.n_envs is not None:
         runner_cfg.n_envs = args.n_envs
+    if isinstance(policy, DiffusionUnetHybridImagePolicy):
+        # The image runner's episode saving runs sequentially and records a
+        # video for every episode (asserts n_envs == 1, n_test_vis == n_test).
+        if args.n_envs not in (None, 1) or num_vis != args.num_episodes:
+            logger.info(
+                "image policy: forcing n_envs=1 and per-episode videos "
+                "(requested n_envs=%s, num_vis=%d)", args.n_envs, num_vis
+            )
+        runner_cfg.n_envs = 1
+        runner_cfg.n_test_vis = args.num_episodes
     if args.dataset_path is not None and "dataset_path" in runner_cfg:
         runner_cfg.dataset_path = args.dataset_path
 
