@@ -149,4 +149,4 @@ dmypy.json
 .pyre/
 exports/
 export/
-clustering/
+clustering/.venv
