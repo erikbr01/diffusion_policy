@@ -11,17 +11,19 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-uv venv --python 3.9 .venv
+uv venv --clear --python 3.9 .venv
 # gym 0.21 needs legacy build tooling
-uv pip install --python .venv/bin/python "setuptools<66" "wheel<0.40" "pip<24"
+uv pip install --python .venv/bin/python "setuptools==65.5.0" "wheel==0.38.4" "pip<24"
 uv pip install --python .venv/bin/python -r requirements.txt
+# gym 0.21 cannot build in isolation (broken extras_require with new setuptools)
+.venv/bin/pip install --quiet --no-build-isolation "gym==0.21.0"
 uv pip install --python .venv/bin/python -e . --no-deps
 
 # Simulators from the policy_graphs submodules when run inside the main repo.
-for sim in ../robomimic ../mimicgen ../robocasa; do
+for sim in ../robomimic ../mimicgen ../robocasa ../robo_dataset; do
     if [ -d "$sim" ]; then
         echo "installing $(basename "$sim") from $sim"
-        uv pip install --python .venv/bin/python -e "$sim" --no-deps
+        .venv/bin/pip install --quiet -e "$sim" --no-deps
     fi
 done
 
