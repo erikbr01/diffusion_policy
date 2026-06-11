@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Create the training environment with uv (no conda).
+#
+# Usage, from the diffusion_policy repo root (third_party/diffusion_policy
+# inside a policy_graphs checkout):
+#
+#   scripts/setup_env_uv.sh
+#
+# Installs the pinned training stack plus the simulator packages from the
+# sibling policy_graphs submodules (robomimic, mimicgen, robocasa).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+uv venv --python 3.9 .venv
+# gym 0.21 needs legacy build tooling
+uv pip install --python .venv/bin/python "setuptools<66" "wheel<0.40" "pip<24"
+uv pip install --python .venv/bin/python -r requirements.txt
+uv pip install --python .venv/bin/python -e . --no-deps
+
+# Simulators from the policy_graphs submodules when run inside the main repo.
+for sim in ../robomimic ../mimicgen ../robocasa; do
+    if [ -d "$sim" ]; then
+        echo "installing $(basename "$sim") from $sim"
+        uv pip install --python .venv/bin/python -e "$sim" --no-deps
+    fi
+done
+
+echo "done: $(.venv/bin/python --version) at $(pwd)/.venv"
