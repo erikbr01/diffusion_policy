@@ -28,3 +28,8 @@ for sim in ../robomimic ../mimicgen ../robocasa ../robo_dataset; do
 done
 
 echo "done: $(.venv/bin/python --version) at $(pwd)/.venv"
+
+# pytorch3d has no linux wheel for this torch/python combo; CPU-only build is
+# sufficient (only pytorch3d.transforms is used, which is pure torch).
+FORCE_CUDA=0 .venv/bin/pip install --no-build-isolation \
+    "git+https://github.com/facebookresearch/pytorch3d.git@v0.7.7"
