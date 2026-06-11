@@ -53,9 +53,13 @@ import torch
 import tqdm
 import yaml
 
+from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.common.trak_util import (
     get_best_checkpoint,
     get_policy_from_checkpoint,
+)
+from diffusion_policy.policy.diffusion_unet_hybrid_image_policy import (
+    DiffusionUnetHybridImagePolicy,
 )
 from diffusion_policy.policy.diffusion_unet_lowdim_policy import DiffusionUnetLowdimPolicy
 
@@ -149,8 +153,8 @@ def _build_action_batch(
 
 
 def _extract_batch(
-    policy: DiffusionUnetLowdimPolicy,
-    obs_batch: np.ndarray,
+    policy,
+    global_cond_b: torch.Tensor,
     action_batch: Optional[np.ndarray],
     action_type: Optional[str],
     hook_name: str,
@@ -160,13 +164,17 @@ def _extract_batch(
     device: torch.device,
     batch_seed: int,
 ) -> np.ndarray:
-    """Return a (B, D) embedding for one batch of rollout timesteps."""
+    """Return a (B, D) embedding for one batch of rollout timesteps.
+
+    ``global_cond_b`` is the (B, cond_dim) UNet conditioning: flattened raw
+    observations for low-dim policies, obs-encoder features for image
+    policies — mirroring each policy's own conditioning path.
+    """
     model = policy.model
-    B = len(obs_batch)
+    B = len(global_cond_b)
     N = len(noise_step_indices)
 
-    obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=device)
-    global_cond = obs_t.reshape(B, -1).repeat_interleave(N, dim=0)
+    global_cond = global_cond_b.to(device).repeat_interleave(N, dim=0)
 
     rng = torch.Generator(device=device)
     rng.manual_seed(batch_seed)
@@ -208,6 +216,31 @@ def _episode_records(pkl_path: pathlib.Path) -> list:
     return list(data)
 
 
+def _lowdim_global_cond(policy, obs_batch: list, device: torch.device) -> torch.Tensor:
+    """Flattened raw obs window, as in the low-dim policy's conditioning."""
+    obs_arr = np.stack(obs_batch, axis=0)
+    obs_t = torch.as_tensor(obs_arr, dtype=torch.float32, device=device)
+    return obs_t.reshape(len(obs_batch), -1)
+
+
+def _image_global_cond(policy, obs_batch: list, device: torch.device) -> torch.Tensor:
+    """Obs-encoder features, mirroring DiffusionUnetHybridImagePolicy.predict_action."""
+    keys = obs_batch[0].keys()
+    obs_dict = {
+        k: torch.as_tensor(
+            np.stack([o[k] for o in obs_batch]), dtype=torch.float32, device=device
+        )
+        for k in keys
+    }
+    with torch.no_grad():
+        obs_dict = policy._center_crop_external(obs_dict)
+        nobs = policy.normalizer.normalize(obs_dict)
+        To = policy.n_obs_steps
+        this_nobs = dict_apply(nobs, lambda x: x[:, :To, ...].reshape(-1, *x.shape[2:]))
+        nobs_features = policy.obs_encoder(this_nobs)
+        return nobs_features.reshape(len(obs_batch), -1)
+
+
 def extract_embeddings(
     policy,
     episodes_dir: pathlib.Path,
@@ -217,10 +250,16 @@ def extract_embeddings(
     device: torch.device,
 ) -> np.ndarray:
     """Extract one embedding per recorded inference step across all episodes."""
-    if not isinstance(policy, DiffusionUnetLowdimPolicy):
+    if isinstance(policy, DiffusionUnetLowdimPolicy):
+        make_global_cond = _lowdim_global_cond
+        obs_is_dict = False
+    elif isinstance(policy, DiffusionUnetHybridImagePolicy):
+        make_global_cond = _image_global_cond
+        obs_is_dict = True
+    else:
         raise NotImplementedError(
-            f"Policy embeddings are only supported for DiffusionUnetLowdimPolicy, "
-            f"got {type(policy).__name__}. Use a low-dim task config."
+            f"Policy embeddings are supported for DiffusionUnetLowdimPolicy and "
+            f"DiffusionUnetHybridImagePolicy, got {type(policy).__name__}."
         )
     hook_name, action_type, t_single = _parse_layer(layer)
     needs_actions = action_type is not None
@@ -247,23 +286,30 @@ def extract_embeddings(
                 f"{pkl_path.name} has {len(records)} records but metadata says {ep_len}"
             )
         for row in records:
-            obs = np.asarray(row["obs"], dtype=np.float32)
-            all_obs.append(obs[np.newaxis, :] if obs.ndim == 1 else obs)
+            if obs_is_dict:
+                all_obs.append(
+                    {k: np.asarray(v, dtype=np.float32) for k, v in row["obs"].items()}
+                )
+            else:
+                obs = np.asarray(row["obs"], dtype=np.float32)
+                all_obs.append(obs[np.newaxis, :] if obs.ndim == 1 else obs)
             if needs_actions:
                 all_actions.append(np.asarray(row["action"], dtype=np.float32))
 
-    obs_arr = np.stack(all_obs, axis=0)
     action_arr = np.stack(all_actions, axis=0) if needs_actions else None
-    n_total = obs_arr.shape[0]
+    n_total = len(all_obs)
     logger.info("extracting layer=%s for %d timesteps", layer, n_total)
 
     sqrt_alpha, sqrt_one_minus_alpha = _build_noise_schedule(n_infer, device)
     results = []
     for start in tqdm.tqdm(range(0, n_total, batch_size), desc="embeddings"):
+        global_cond_b = make_global_cond(
+            policy, all_obs[start:start + batch_size], device
+        )
         results.append(
             _extract_batch(
                 policy,
-                obs_arr[start:start + batch_size],
+                global_cond_b,
                 action_arr[start:start + batch_size] if needs_actions else None,
                 action_type,
                 hook_name,
