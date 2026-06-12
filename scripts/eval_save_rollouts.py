@@ -291,6 +291,13 @@ def main() -> None:
                         help="Parallel envs; default keeps the checkpoint config value.")
     parser.add_argument("--dataset-path", default=None,
                         help="Override the env runner's dataset path (env metadata).")
+    parser.add_argument("--runner-target", default=None,
+                        help="Override cfg.task.env_runner._target_ (e.g. the robocasa365 "
+                             "runner for the released multitask checkpoint, whose embedded "
+                             "target points at the benchmark fork's runner).")
+    parser.add_argument("--runner-set", action="append", default=[],
+                        help="key=value override applied to the env runner cfg (repeatable), "
+                             "e.g. --runner-set env_name=PickPlaceCounterToCabinet")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch-size", type=int, default=128,
                         help="Batch size for embedding extraction.")
@@ -338,6 +345,12 @@ def main() -> None:
         runner_cfg.n_test_vis = args.num_episodes
     if args.dataset_path is not None and "dataset_path" in runner_cfg:
         runner_cfg.dataset_path = args.dataset_path
+    if args.runner_target is not None:
+        runner_cfg._target_ = args.runner_target
+    for override in args.runner_set:
+        key, _, value = override.partition("=")
+        from omegaconf import OmegaConf as _OC
+        _OC.update(runner_cfg, key, yaml.safe_load(value), force_add=True)
 
     env_runner = hydra.utils.instantiate(
         runner_cfg, output_dir=str(output_dir), save_episodes=True

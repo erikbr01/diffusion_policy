@@ -36,6 +36,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             num_inference_steps=None,
             # image
             crop_shape=(76, 76),
+            vision_backbone="resnet18",
             obs_encoder_group_norm=False,
             eval_fixed_crop=False,
             # arch
@@ -101,6 +102,27 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
                         modality.obs_randomizer_kwargs.crop_width = cw
 
         # init global state
+        with config.unlocked():
+            if vision_backbone == "resnet18":
+                config.observation.encoder.rgb.core_kwargs.backbone_class = "ResNet18Conv"
+            elif vision_backbone == "resnet34":
+                config.observation.encoder.rgb.core_kwargs.backbone_class = "ResNet34Conv"
+            elif vision_backbone == "resnet50":
+                config.observation.encoder.rgb.core_kwargs.backbone_class = "ResNet50Conv"
+
+            # robocasa365 multitask checkpoints: language-conditioned FiLM visual
+            # cores (requires the robocasa-benchmark robomimic flavor).
+            if "lang_emb" in obs_config["low_dim"]:
+                config.observation.encoder.rgb.core_class = "VisualCoreLanguageConditioned"
+                if vision_backbone == "resnet18":
+                    config.observation.encoder.rgb.core_kwargs.backbone_class = "ResNet18ConvFiLM"
+                elif vision_backbone == "resnet34":
+                    config.observation.encoder.rgb.core_kwargs.backbone_class = "ResNet34ConvFiLM"
+                elif vision_backbone == "resnet50":
+                    config.observation.encoder.rgb.core_kwargs.backbone_class = "ResNet50ConvFiLM"
+                else:
+                    raise NotImplementedError(vision_backbone)
+
         ObsUtils.initialize_obs_utils_with_config(config)
 
         # load model
