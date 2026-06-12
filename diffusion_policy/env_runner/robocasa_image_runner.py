@@ -63,14 +63,18 @@ def create_env(env_meta, shape_meta, enable_render=True):
         # Construct the EnvRobosuite wrapper directly, bypassing the buggy print.
         from robomimic.envs.env_robosuite import EnvRobosuite
         env_kwargs = _copy.deepcopy(env_meta.get("env_kwargs", {}))
-        env = EnvRobosuite(
+        base_kwargs = dict(
             env_name=env_meta["env_name"],
             render=False,
             render_offscreen=enable_render,
             use_image_obs=enable_render,
-            postprocess_visual_obs=True,
-            **env_kwargs,
         )
+        try:
+            env = EnvRobosuite(postprocess_visual_obs=True, **base_kwargs, **env_kwargs)
+        except TypeError:
+            # robomimic >=0.3 forwards unknown kwargs to the robosuite env;
+            # obs layout is normalized downstream in RobomimicImageWrapper.
+            env = EnvRobosuite(**base_kwargs, **env_kwargs)
     return env
 
 
@@ -244,6 +248,21 @@ def _eval_worker(result_queue, policy_path, eval_config):
                     if not np.all(np.isfinite(action)):
                         raise RuntimeError(f"Nan or Inf action: {action}")
 
+                    if save_episodes:
+                        # One record per inference call (obs window + full
+                        # predicted plan), as in robomimic_image_runner.
+                        action_plan = np_action_dict.get(
+                            'action_pred', np_action_dict['action']
+                        )
+                        episode_data.append({
+                            "timestep": timestep,
+                            "obs": {
+                                k: np.asarray(v, dtype=np.float32)[0]
+                                for k, v in np_obs_dict.items()
+                            },
+                            "action": np.asarray(action_plan, dtype=np.float32)[0],
+                        })
+
                     env_action = action
                     if abs_action:
                         env_action = _undo_transform_action(action, rotation_transformer)
@@ -268,7 +287,9 @@ def _eval_worker(result_queue, policy_path, eval_config):
                 if save_episodes:
                     success = bool(info.get('success', False))
                     postfix = "succ" if success else "fail"
-                    episode_lengths.append(timestep)
+                    # Lengths count inference calls so episode rows align
+                    # 1:1 with the recorded data (and extracted embeddings).
+                    episode_lengths.append(len(episode_data))
                     episode_successes.append(success)
                     ep_dir = pathlib.Path(episode_dir)
                     with open(ep_dir / f"ep{ep_idx:04d}_{postfix}.pkl", "wb") as f:
@@ -669,9 +690,12 @@ class RobocasaImageRunner(BaseImageRunner):
             log_data[prefix + f'sim_max_reward_{seed}'] = max_reward
 
             video_path = all_video_paths[i]
-            if video_path is not None:
-                sim_video = wandb.Video(video_path)
-                log_data[prefix + f'sim_video_{seed}'] = sim_video
+            if video_path is not None and pathlib.Path(video_path).is_file():
+                try:
+                    log_data[prefix + f'sim_video_{seed}'] = wandb.Video(video_path)
+                except Exception as e:
+                    # wandb media is logging sugar only — never fail the eval on it.
+                    print(f"skipping wandb video for {video_path}: {e}")
 
         for prefix, value in max_rewards.items():
             name = prefix + 'mean_score'

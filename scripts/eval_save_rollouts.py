@@ -69,6 +69,9 @@ from diffusion_policy.common.trak_util import (
     get_best_checkpoint,
     get_policy_from_checkpoint,
 )
+from diffusion_policy.policy.diffusion_transformer_hybrid_image_policy import (
+    DiffusionTransformerHybridImagePolicy,
+)
 from diffusion_policy.policy.diffusion_unet_hybrid_image_policy import (
     DiffusionUnetHybridImagePolicy,
 )
@@ -175,7 +178,7 @@ def executed_action_index(policy, n_latency_steps: int) -> int:
     latency cut (``action[:, n_latency_steps:]``); the image runner executes
     the slice as-is.
     """
-    if isinstance(policy, DiffusionUnetHybridImagePolicy):
+    if isinstance(policy, (DiffusionUnetHybridImagePolicy, DiffusionTransformerHybridImagePolicy)):
         return policy.n_obs_steps - 1
     if getattr(policy, "pred_action_steps_only", False):
         return n_latency_steps
@@ -203,7 +206,9 @@ def extract_states_and_actions(
     n_latency_steps: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Per recorded step: the flattened low-dim state + the first executed action."""
-    obs_is_dict = isinstance(policy, DiffusionUnetHybridImagePolicy)
+    obs_is_dict = isinstance(
+        policy, (DiffusionUnetHybridImagePolicy, DiffusionTransformerHybridImagePolicy)
+    )
     exec_idx = executed_action_index(policy, n_latency_steps)
 
     pkls = sorted(episodes_dir.glob("ep*.pkl"))
@@ -321,7 +326,7 @@ def main() -> None:
     runner_cfg.test_start_seed = args.seed
     if args.n_envs is not None:
         runner_cfg.n_envs = args.n_envs
-    if isinstance(policy, DiffusionUnetHybridImagePolicy):
+    if isinstance(policy, (DiffusionUnetHybridImagePolicy, DiffusionTransformerHybridImagePolicy)):
         # The image runner's episode saving runs sequentially and records a
         # video for every episode (asserts n_envs == 1, n_test_vis == n_test).
         if args.n_envs not in (None, 1) or num_vis != args.num_episodes:
@@ -338,7 +343,13 @@ def main() -> None:
         runner_cfg, output_dir=str(output_dir), save_episodes=True
     )
     logger.info("running %d episodes (seed=%d)", args.num_episodes, args.seed)
-    runner_log = env_runner.run(policy)
+    import inspect
+
+    if "policy_cfg" in inspect.signature(env_runner.run).parameters:
+        # The robocasa runner re-instantiates the policy in eval subprocesses.
+        runner_log = env_runner.run(policy, policy_cfg=cfg.policy)
+    else:
+        runner_log = env_runner.run(policy)
 
     json_log = {k: v for k, v in runner_log.items() if isinstance(v, (int, float, str, bool))}
     with open(output_dir / "eval_log.json", "w") as f:

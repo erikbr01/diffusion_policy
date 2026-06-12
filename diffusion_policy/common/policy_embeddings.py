@@ -33,6 +33,9 @@ from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.policy.diffusion_unet_hybrid_image_policy import (
     DiffusionUnetHybridImagePolicy,
 )
+from diffusion_policy.policy.diffusion_transformer_hybrid_image_policy import (
+    DiffusionTransformerHybridImagePolicy,
+)
 from diffusion_policy.policy.diffusion_unet_lowdim_policy import DiffusionUnetLowdimPolicy
 
 DEFAULT_LAYER = "bottleneck_plan_t0"
@@ -122,7 +125,9 @@ def image_global_cond(policy, obs_batch: List, device: torch.device) -> torch.Te
         for k in keys
     }
     with torch.no_grad():
-        obs_dict = policy._center_crop_external(obs_dict)
+        crop = getattr(policy, "_center_crop_external", None)
+        if crop is not None:
+            obs_dict = crop(obs_dict)
         nobs = policy.normalizer.normalize(obs_dict)
         To = policy.n_obs_steps
         this_nobs = dict_apply(nobs, lambda x: x[:, :To, ...].reshape(-1, *x.shape[2:]))
@@ -202,13 +207,16 @@ class PolicyEmbeddingExtractor:
         if isinstance(policy, DiffusionUnetLowdimPolicy):
             self._make_global_cond = lowdim_global_cond
             self.obs_is_dict = False
-        elif isinstance(policy, DiffusionUnetHybridImagePolicy):
+        elif isinstance(
+            policy, (DiffusionUnetHybridImagePolicy, DiffusionTransformerHybridImagePolicy)
+        ):
             self._make_global_cond = image_global_cond
             self.obs_is_dict = True
         else:
             raise NotImplementedError(
-                f"Policy embeddings are supported for DiffusionUnetLowdimPolicy and "
-                f"DiffusionUnetHybridImagePolicy, got {type(policy).__name__}."
+                f"Policy embeddings are supported for DiffusionUnetLowdimPolicy, "
+                f"DiffusionUnetHybridImagePolicy and DiffusionTransformerHybridImagePolicy, "
+                f"got {type(policy).__name__}."
             )
         self.policy = policy
         self.layer = layer
@@ -219,6 +227,11 @@ class PolicyEmbeddingExtractor:
             self.action_type = None
             self.needs_actions = False
             return
+        if isinstance(policy, DiffusionTransformerHybridImagePolicy):
+            raise NotImplementedError(
+                "Transformer policies have no UNet hook layers; use "
+                f"layer='{OBS_ENCODER_LAYER}' for {type(policy).__name__}."
+            )
         self.hook_name, self.action_type, t_single = parse_layer(layer)
         self.needs_actions = self.action_type is not None
 
