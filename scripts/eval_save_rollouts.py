@@ -7,7 +7,20 @@ embeddings from the diffusion U-Net, and writes:
     <output_dir>/
         episodes/metadata.yaml          episodes: [{index, length, success}]
         policy_embeddings/<layer>.npz   (total_steps, d) float32, key "embeddings"
+        observations/state.npz          (total_steps, d_obs) float32, key "observations"
+        actions.npz                     (total_steps, d_action) float32, key "actions"
         media/ep{idx:04d}_{success|failure}.mp4   (with --num-vis != 0)
+
+``observations/state.npz`` is the low-dim state at the moment of each recorded
+inference step: for low-dim policies the LAST frame of the recorded (To, d_obs)
+obs window, flattened; for image policies the low-dim ('agent_pos'-style) keys
+of the obs dict — i.e. the non-image entries, last frame each — concatenated in
+sorted key order. ``actions.npz`` is the FIRST action the runner executes from
+each step's predicted plan: the runners step the env with the policy's
+``action`` output, which is ``action_pred[To-1 : To-1+n_action_steps]`` for
+image policies and ``action_pred[start : start+n_action_steps]`` with
+``start = To-1`` (``oa_step_convention``) or ``To`` for low-dim policies, minus
+the runner's first ``n_latency_steps``; we store the first row of that slice.
 
 Per-timestep alignment: the low-dim env runners record one row per policy
 inference call (one action chunk of ``n_action_steps`` executed steps), storing
@@ -18,7 +31,10 @@ embeddings align 1:1 with the episode sample ranges.
 Embedding layer names are documented in
 ``diffusion_policy/common/policy_embeddings.py`` (the shared extraction
 machinery). The default ``bottleneck_plan_t0`` conditions the UNet bottleneck
-on the actual predicted plan at the final denoising step.
+on the actual predicted plan at the final denoising step. ``--layer
+obs_encoder`` skips the UNet pass and stores the policy's conditioning vector
+(obs-encoder features for image policies, the flattened raw obs window for
+low-dim policies).
 
 Usage (from the repo root, in the sim conda env):
     python scripts/eval_save_rollouts.py \
@@ -148,6 +164,72 @@ def extract_embeddings(
 
 
 # ---------------------------------------------------------------------------
+# Raw state / executed-action extraction
+# ---------------------------------------------------------------------------
+
+def executed_action_index(policy, n_latency_steps: int) -> int:
+    """Index into the recorded action plan of the first executed action.
+
+    Mirrors each policy's ``predict_action`` slicing (``action =
+    action_pred[start : start + n_action_steps]``) plus the low-dim runner's
+    latency cut (``action[:, n_latency_steps:]``); the image runner executes
+    the slice as-is.
+    """
+    if isinstance(policy, DiffusionUnetHybridImagePolicy):
+        return policy.n_obs_steps - 1
+    if getattr(policy, "pred_action_steps_only", False):
+        return n_latency_steps
+    start = policy.n_obs_steps - (1 if getattr(policy, "oa_step_convention", False) else 0)
+    return start + n_latency_steps
+
+
+def _state_vector(row_obs, obs_is_dict: bool) -> np.ndarray:
+    """Flattened low-dim state for one recorded step (see module docstring)."""
+    if obs_is_dict:
+        lowdim_keys = sorted(k for k, v in row_obs.items() if np.asarray(v).ndim == 2)
+        if not lowdim_keys:
+            raise RuntimeError(f"no low-dim obs keys among {sorted(row_obs)}")
+        return np.concatenate(
+            [np.asarray(row_obs[k], dtype=np.float32)[-1].ravel() for k in lowdim_keys]
+        )
+    obs = np.asarray(row_obs, dtype=np.float32)
+    return obs.ravel() if obs.ndim == 1 else obs[-1].ravel()
+
+
+def extract_states_and_actions(
+    policy,
+    episodes_dir: pathlib.Path,
+    lengths: List[int],
+    n_latency_steps: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Per recorded step: the flattened low-dim state + the first executed action."""
+    obs_is_dict = isinstance(policy, DiffusionUnetHybridImagePolicy)
+    exec_idx = executed_action_index(policy, n_latency_steps)
+
+    pkls = sorted(episodes_dir.glob("ep*.pkl"))
+    if len(pkls) != len(lengths):
+        raise RuntimeError(
+            f"{len(pkls)} episode pickles but metadata lists {len(lengths)} episodes"
+        )
+
+    states, actions = [], []
+    for pkl_path, ep_len in zip(pkls, lengths):
+        records = _episode_records(pkl_path)
+        if len(records) != ep_len:
+            raise RuntimeError(
+                f"{pkl_path.name} has {len(records)} records but metadata says {ep_len}"
+            )
+        for row in records:
+            states.append(_state_vector(row["obs"], obs_is_dict))
+            plan = np.asarray(row["action"], dtype=np.float32)
+            actions.append(plan[exec_idx])
+    return (
+        np.stack(states, axis=0).astype(np.float32),
+        np.stack(actions, axis=0).astype(np.float32),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Canonical rollout layout
 # ---------------------------------------------------------------------------
 
@@ -213,13 +295,16 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
 
     output_dir = pathlib.Path(args.output_dir)
-    for sub in ("episodes", "media", "policy_embeddings"):
+    for sub in ("episodes", "media", "policy_embeddings", "observations", "actions.npz"):
         if (output_dir / sub).exists():
             if not args.overwrite:
                 raise FileExistsError(
                     f"{output_dir / sub} already exists; pass --overwrite to replace"
                 )
-            shutil.rmtree(output_dir / sub)
+            if (output_dir / sub).is_dir():
+                shutil.rmtree(output_dir / sub)
+            else:
+                (output_dir / sub).unlink()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoint = resolve_checkpoint(pathlib.Path(args.checkpoint))
@@ -272,6 +357,21 @@ def main() -> None:
     emb_dir = output_dir / "policy_embeddings"
     emb_dir.mkdir(exist_ok=True)
     np.savez_compressed(emb_dir / f"{args.layer}.npz", embeddings=embeddings)
+
+    n_latency_steps = int(runner_cfg.get("n_latency_steps", 0) or 0)
+    states, exec_actions = extract_states_and_actions(
+        policy, episodes_dir, lengths, n_latency_steps
+    )
+    if states.shape[0] != sum(lengths):
+        raise RuntimeError(
+            f"{states.shape[0]} states but episode lengths sum to {sum(lengths)}"
+        )
+    obs_dir = output_dir / "observations"
+    obs_dir.mkdir(exist_ok=True)
+    np.savez_compressed(obs_dir / "state.npz", observations=states)
+    np.savez_compressed(output_dir / "actions.npz", actions=exec_actions)
+    logger.info("wrote state %s and executed actions %s", states.shape, exec_actions.shape)
+
     _write_canonical_metadata(episodes_dir, lengths, successes)
     _rename_media(output_dir / "media")
     logger.info(

@@ -15,6 +15,10 @@ Embedding layer names follow ``{bottleneck|decoder|encoder}[_{plan|plan8|exec}][
 
 The default ``bottleneck_plan_t0`` conditions the UNet bottleneck on the actual
 action plan at the final denoising step.
+
+The special layer ``obs_encoder`` skips the UNet pass entirely and returns the
+policy's conditioning vector: the obs-encoder features for image policies, the
+flattened raw obs window for low-dim policies.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ from diffusion_policy.policy.diffusion_unet_hybrid_image_policy import (
 from diffusion_policy.policy.diffusion_unet_lowdim_policy import DiffusionUnetLowdimPolicy
 
 DEFAULT_LAYER = "bottleneck_plan_t0"
+OBS_ENCODER_LAYER = "obs_encoder"
 
 _LAYER_RE = re.compile(
     r"^(?P<hook>bottleneck|decoder|encoder)"
@@ -46,7 +51,8 @@ def parse_layer(layer: str) -> Tuple[str, Optional[str], Optional[int]]:
     if m is None:
         raise ValueError(
             f"Unknown layer {layer!r}. Format: "
-            f"{{bottleneck|decoder|encoder}}[_{{plan|plan8|exec}}][_t{{T}}]"
+            f"{{bottleneck|decoder|encoder}}[_{{plan|plan8|exec}}][_t{{T}}], "
+            f"or the special layer {OBS_ENCODER_LAYER!r}"
         )
     t = m.group("t")
     return m.group("hook"), m.group("action"), None if t is None else int(t)
@@ -186,6 +192,10 @@ class PolicyEmbeddingExtractor:
     obs dicts (image policies) vs (To, obs_dim) arrays (low-dim policies).
     ``needs_actions`` is True when the layer conditions on the action plan
     (``plan``/``plan8``/``exec``); pass (B, horizon, action_dim) plans then.
+
+    The ``obs_encoder`` layer returns the conditioning vector itself (no UNet
+    pass): obs-encoder features for image policies, the flattened raw obs
+    window for low-dim policies.
     """
 
     def __init__(self, policy, layer: str, device: torch.device) -> None:
@@ -203,6 +213,12 @@ class PolicyEmbeddingExtractor:
         self.policy = policy
         self.layer = layer
         self.device = device
+        self.is_obs_encoder = layer == OBS_ENCODER_LAYER
+        if self.is_obs_encoder:
+            self.hook_name = None
+            self.action_type = None
+            self.needs_actions = False
+            return
         self.hook_name, self.action_type, t_single = parse_layer(layer)
         self.needs_actions = self.action_type is not None
 
@@ -227,6 +243,8 @@ class PolicyEmbeddingExtractor:
     ) -> np.ndarray:
         """Return (B, D) embeddings for one batch of timesteps."""
         global_cond_b = self._make_global_cond(self.policy, obs_batch, self.device)
+        if self.is_obs_encoder:
+            return global_cond_b.detach().cpu().numpy().astype(np.float32)
         return extract_batch(
             self.policy,
             global_cond_b,
