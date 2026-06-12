@@ -14,13 +14,15 @@ cd "$(dirname "$0")/.."
 uv venv --clear --python 3.9 .venv
 # gym 0.21 needs legacy build tooling
 uv pip install --python .venv/bin/python "setuptools==65.5.0" "wheel==0.38.4" "pip<24"
-uv pip install --python .venv/bin/python -r requirements.txt
+uv pip install --python .venv/bin/python -r requirements.lock.txt
 # gym 0.21 cannot build in isolation (broken extras_require with new setuptools)
 .venv/bin/pip install --quiet --no-build-isolation "gym==0.21.0"
 uv pip install --python .venv/bin/python -e . --no-deps
 
 # Simulators from the policy_graphs submodules when run inside the main repo.
-for sim in ../robomimic ../mimicgen ../robocasa ../robo_dataset; do
+# robomimic comes pinned from requirements.txt (stock 0.3.0, as policy_doctor);
+# robocasa needs its own venv (see docs/environments.md).
+for sim in ../mimicgen ../robo_dataset; do
     if [ -d "$sim" ]; then
         echo "installing $(basename "$sim") from $sim"
         .venv/bin/pip install --quiet -e "$sim" --no-deps
