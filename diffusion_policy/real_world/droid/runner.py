@@ -1,0 +1,288 @@
+"""DROID real-robot inference runner (control loop only; no persistence).
+
+Three inference modes
+---------------------
+SYNC
+    Inference blocks the control loop. At every open_loop_horizon boundary,
+    submit + get() before executing the next chunk.
+
+ASYNC_CHUNK
+    At the start of each chunk, submit inference for the *next* chunk
+    immediately. Execute the current chunk at control_hz while inference runs
+    in the background; block for the new chunk only at the chunk boundary.
+
+ASYNC_STREAMING
+    A dedicated background thread calls submit → get in a tight loop, always
+    using the latest observation. The foreground control loop reads from a
+    lock-protected buffer at control_hz; if the buffer is empty (policy slower
+    than the loop), applies the StaleActionPolicy.
+"""
+
+from __future__ import annotations
+
+import enum
+import logging
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+import numpy as np
+
+from diffusion_policy.real_world.droid.env import DROIDInferenceEnv
+from diffusion_policy.real_world.droid.policy_client import PolicyBase
+
+logger = logging.getLogger(__name__)
+
+
+class InferenceMode(enum.Enum):
+    SYNC = "sync"
+    ASYNC_CHUNK = "async_chunk"
+    ASYNC_STREAMING = "async_streaming"
+
+
+class StaleActionPolicy(enum.Enum):
+    HOLD_LAST = "hold_last"
+    ZERO_ON_STALE = "zero_on_stale"
+
+
+@dataclass
+class EpisodeRecord:
+    episode_idx: int
+    instruction: str
+    n_steps: int
+    n_new_chunks: int
+    n_stale_steps: int
+    success: Optional[bool]  # real-robot success is annotated externally
+    avg_chunk_latency_ms: float
+    chunk_latencies_ms: List[float] = field(default_factory=list)
+
+
+class DROIDInferenceRunner:
+    """Run one or many rollouts with a configurable inference mode.
+
+    The runner is a pure control loop: episode persistence is the caller's
+    job (drain ``env.pop_episode_data()`` after each ``run_episode``).
+    """
+
+    def __init__(
+        self,
+        env: DROIDInferenceEnv,
+        policy: PolicyBase,
+        mode: InferenceMode = InferenceMode.ASYNC_CHUNK,
+        stale_action_policy: StaleActionPolicy = StaleActionPolicy.HOLD_LAST,
+        open_loop_horizon: int = 8,
+        max_timesteps: int = 600,
+        control_hz: float = 15.0,
+    ) -> None:
+        self.env = env
+        self.policy = policy
+        self.mode = mode
+        self.stale_action_policy = stale_action_policy
+        self.open_loop_horizon = open_loop_horizon
+        self.max_timesteps = max_timesteps
+        self.control_hz = control_hz
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def run_episode(self, instruction: str = "", episode_idx: int = 0) -> EpisodeRecord:
+        """Run a single rollout and return a summary record."""
+        obs = self.env.reset()
+        self.policy.reset()
+
+        if self.mode == InferenceMode.SYNC:
+            return self._run_sync(obs, instruction, episode_idx)
+        if self.mode == InferenceMode.ASYNC_CHUNK:
+            return self._run_async_chunk(obs, instruction, episode_idx)
+        return self._run_async_streaming(obs, instruction, episode_idx)
+
+    # ------------------------------------------------------------------
+    # SYNC mode
+    # ------------------------------------------------------------------
+
+    def _run_sync(self, obs: dict, instruction: str, episode_idx: int) -> EpisodeRecord:
+        dt = 1.0 / self.control_hz
+        chunk: Optional[np.ndarray] = None
+        chunk_idx = 0
+        n_chunks = 0
+        latencies: List[float] = []
+
+        for _ in range(self.max_timesteps):
+            t0 = time.time()
+
+            if chunk is None or chunk_idx >= self.open_loop_horizon or chunk_idx >= len(chunk):
+                t_inf = time.time()
+                self.policy.submit(obs, instruction)
+                chunk = self.policy.get()
+                latencies.append((time.time() - t_inf) * 1000)
+                chunk_idx = 0
+                n_chunks += 1
+
+            action = chunk[chunk_idx]
+            chunk_idx += 1
+            obs, _, _, _ = self.env.step(action)
+
+            elapsed = time.time() - t0
+            if elapsed < dt:
+                time.sleep(dt - elapsed)
+
+        return self._make_record(
+            episode_idx, instruction, self.max_timesteps, n_chunks, 0, latencies
+        )
+
+    # ------------------------------------------------------------------
+    # ASYNC_CHUNK mode
+    # ------------------------------------------------------------------
+
+    def _run_async_chunk(
+        self, obs: dict, instruction: str, episode_idx: int
+    ) -> EpisodeRecord:
+        dt = 1.0 / self.control_hz
+        n_chunks = 0
+        latencies: List[float] = []
+
+        # Submit the first chunk immediately.
+        t_submit = time.time()
+        self.policy.submit(obs, instruction)
+
+        total_steps = 0
+        while total_steps < self.max_timesteps:
+            # Block for the pending chunk (should already be done when we arrive).
+            chunk = self.policy.get()
+            latencies.append((time.time() - t_submit) * 1000)
+            n_chunks += 1
+
+            horizon = min(self.open_loop_horizon, len(chunk), self.max_timesteps - total_steps)
+
+            for i in range(horizon):
+                t0 = time.time()
+                obs, _, _, _ = self.env.step(chunk[i])
+                total_steps += 1
+
+                # Submit the next chunk right after the first step of this one
+                # so inference overlaps with execution of steps 1..horizon-1.
+                if i == 0:
+                    t_submit = time.time()
+                    self.policy.submit(obs, instruction)
+
+                elapsed = time.time() - t0
+                if elapsed < dt:
+                    time.sleep(dt - elapsed)
+
+        return self._make_record(
+            episode_idx, instruction, total_steps, n_chunks, 0, latencies
+        )
+
+    # ------------------------------------------------------------------
+    # ASYNC_STREAMING mode
+    # ------------------------------------------------------------------
+
+    def _run_async_streaming(
+        self, obs: dict, instruction: str, episode_idx: int
+    ) -> EpisodeRecord:
+        dt = 1.0 / self.control_hz
+
+        # Shared state between foreground loop and inference thread.
+        _lock = threading.Lock()
+        _obs_ref: List[dict] = [obs]
+        _instr_ref: List[str] = [instruction]
+        _buffer: List[Optional[np.ndarray]] = [None]
+        _chunk_step: List[int] = [0]
+        _last_action: List[Optional[np.ndarray]] = [None]
+        _stop = threading.Event()
+        latencies: List[float] = []
+        n_chunks_ref: List[int] = [0]
+
+        def _inference_thread() -> None:
+            while not _stop.is_set():
+                with _lock:
+                    curr_obs = _obs_ref[0]
+                    curr_instr = _instr_ref[0]
+                t0 = time.time()
+                try:
+                    self.policy.submit(curr_obs, curr_instr)
+                    new_chunk = self.policy.get()
+                except Exception as e:  # noqa: BLE001 — keep the loop alive
+                    logger.warning("inference error: %s", e)
+                    continue
+                lat_ms = (time.time() - t0) * 1000
+                with _lock:
+                    _buffer[0] = new_chunk
+                    _chunk_step[0] = 0  # latest beats stale: drop unexecuted tail
+                    n_chunks_ref[0] += 1
+                    latencies.append(lat_ms)
+
+        thread = threading.Thread(target=_inference_thread, daemon=True, name="droid_infer")
+        thread.start()
+
+        n_stale = 0
+        total_steps = 0
+        action_dim = self.env.action_dim
+
+        try:
+            for _ in range(self.max_timesteps):
+                t0 = time.time()
+
+                with _lock:
+                    chunk = _buffer[0]
+                    idx = _chunk_step[0]
+
+                if chunk is not None and idx < len(chunk):
+                    action = chunk[idx]
+                    with _lock:
+                        _chunk_step[0] += 1
+                    _last_action[0] = action
+                else:
+                    # Buffer exhausted or not yet ready.
+                    if (
+                        self.stale_action_policy == StaleActionPolicy.HOLD_LAST
+                        and _last_action[0] is not None
+                    ):
+                        action = _last_action[0]
+                    else:
+                        action = np.zeros(action_dim, dtype=np.float32)
+                    n_stale += 1
+
+                new_obs, _, _, _ = self.env.step(action)
+                total_steps += 1
+
+                with _lock:
+                    _obs_ref[0] = new_obs
+
+                elapsed = time.time() - t0
+                if elapsed < dt:
+                    time.sleep(dt - elapsed)
+        finally:
+            _stop.set()
+            thread.join(timeout=5.0)
+
+        return self._make_record(
+            episode_idx, instruction, total_steps, n_chunks_ref[0], n_stale, latencies
+        )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_record(
+        episode_idx: int,
+        instruction: str,
+        n_steps: int,
+        n_chunks: int,
+        n_stale: int,
+        latencies: List[float],
+    ) -> EpisodeRecord:
+        avg_lat = float(np.mean(latencies)) if latencies else 0.0
+        return EpisodeRecord(
+            episode_idx=episode_idx,
+            instruction=instruction,
+            n_steps=n_steps,
+            n_new_chunks=n_chunks,
+            n_stale_steps=n_stale,
+            success=None,
+            avg_chunk_latency_ms=avg_lat,
+            chunk_latencies_ms=list(latencies),
+        )
