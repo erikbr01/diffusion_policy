@@ -506,6 +506,36 @@ class RoboStoreLowdimDataset(_RoboStoreMixin, BaseLowdimDataset):
         }
 
 
+def _task_episode_mask(
+    store_path: str,
+    task_filter: Optional[List[str]],
+    max_episodes_per_task: Optional[int],
+    n_episodes: int,
+) -> Optional[np.ndarray]:
+    if task_filter is None and max_episodes_per_task is None:
+        return None
+    import json, pathlib
+    tasks_path = pathlib.Path(store_path) / "tasks.json"
+    if not tasks_path.exists():
+        raise FileNotFoundError(
+            f"tasks.json not found at {tasks_path} — re-run conversion to generate it"
+        )
+    with open(tasks_path) as f:
+        ep_tasks: dict = json.load(f)
+    mask = np.zeros(n_episodes, dtype=bool)
+    counts: dict = {}
+    for ep_idx in range(n_episodes):
+        task = ep_tasks.get(str(ep_idx), "")
+        if task_filter is not None and task not in task_filter:
+            continue
+        if max_episodes_per_task is not None:
+            if counts.get(task, 0) >= max_episodes_per_task:
+                continue
+            counts[task] = counts.get(task, 0) + 1
+        mask[ep_idx] = True
+    return mask
+
+
 class RoboStoreImageDataset(_RoboStoreMixin, BaseImageDataset):
     """Image dataset over a robo_dataset store (cameras decoded from H.264).
 
@@ -538,6 +568,8 @@ class RoboStoreImageDataset(_RoboStoreMixin, BaseImageDataset):
         # Per-key normalization overrides (robo_dataset.normalization specs);
         # None = robomimic defaults (see _default_lowdim_spec / _IMAGE_SPEC).
         normalization: Optional[Dict[str, Any]] = None,
+        task_filter: Optional[List[str]] = None,
+        max_episodes_per_task: Optional[int] = None,
     ):
         rgb_keys, lowdim_keys = [], []
         for key, attr in shape_meta["obs"].items():
@@ -578,6 +610,22 @@ class RoboStoreImageDataset(_RoboStoreMixin, BaseImageDataset):
             verify_curation_dataset_identity=verify_curation_dataset_identity,
             store_kwargs=store_kwargs,
         )
+        if task_filter is not None or max_episodes_per_task is not None:
+            task_mask = _task_episode_mask(
+                store_path, task_filter, max_episodes_per_task, self.store.n_episodes
+            )
+            from robo_dataset.dataset import TrajectoryDataset
+            combined = self.train_mask & task_mask
+            self._traj = TrajectoryDataset(
+                self.store,
+                horizon=horizon,
+                pad_before=pad_before,
+                pad_after=pad_after,
+                keys=rgb_keys + lowdim_keys + ["action"],
+                key_first_k=key_first_k,
+                episode_mask=combined,
+            )
+            self.train_mask = combined
 
     @staticmethod
     def _default_lowdim_spec(key: str) -> str:
