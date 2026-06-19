@@ -66,6 +66,52 @@ def robo_store_worker_init_fn(worker_id: int) -> None:
         store.on_worker_init(worker_id)
 
 
+def _load_episodes_into_shm(
+    source,
+    episode_mask: np.ndarray,
+    keys: List[str],
+    verbose: bool = True,
+) -> "ShmStore":
+    """Load only the episodes selected by *episode_mask* into shared memory.
+
+    Builds a compact ShmStore where episode indices run 0..N-1 (N = number of
+    True entries in episode_mask).  Workers can read it zero-copy after fork;
+    ``on_worker_init`` is a no-op.
+    """
+    from robo_dataset.backends.shm import ShmStore
+
+    ep_ends = source.episode_ends
+    ep_starts = np.concatenate([[0], ep_ends[:-1]])
+    selected = np.where(episode_mask)[0]
+
+    ep_lengths = ep_ends[selected] - ep_starts[selected]
+    new_ep_ends = np.cumsum(ep_lengths).astype(np.int64)
+
+    data: Dict[str, torch.Tensor] = {}
+    dtypes: Dict[str, np.dtype] = {}
+    shapes: Dict[str, tuple] = {}
+
+    it = iter(keys)
+    if verbose:
+        try:
+            from tqdm import tqdm
+            it = tqdm(keys, desc=f"ShmStore: loading {len(selected)} episodes to RAM")
+        except ImportError:
+            pass
+
+    for key in it:
+        chunks = []
+        for ep_idx in selected:
+            chunk = source.get_sequence(key, int(ep_starts[ep_idx]), int(ep_ends[ep_idx]))
+            chunks.append(np.ascontiguousarray(chunk))
+        arr = np.concatenate(chunks, axis=0)
+        dtypes[key] = arr.dtype
+        shapes[key] = source.frame_shape(key)
+        data[key] = torch.from_numpy(arr).share_memory_()
+
+    return ShmStore(data, new_ep_ends, dtypes, shapes)
+
+
 def _validate_action_schema(schema, abs_action: bool, store_path: str) -> None:
     """Loudly reject a store whose action layout contradicts the abs_action flag.
 
@@ -570,6 +616,7 @@ class RoboStoreImageDataset(_RoboStoreMixin, BaseImageDataset):
         normalization: Optional[Dict[str, Any]] = None,
         task_filter: Optional[List[str]] = None,
         max_episodes_per_task: Optional[int] = None,
+        use_shm: bool = False,
     ):
         rgb_keys, lowdim_keys = [], []
         for key, attr in shape_meta["obs"].items():
@@ -626,6 +673,25 @@ class RoboStoreImageDataset(_RoboStoreMixin, BaseImageDataset):
                 episode_mask=combined,
             )
             self.train_mask = combined
+
+        if use_shm:
+            shm_store = _load_episodes_into_shm(
+                self.store,
+                self.train_mask,
+                rgb_keys + lowdim_keys + ["action"],
+            )
+            self.store = shm_store
+            all_ep_mask = np.ones(shm_store.n_episodes, dtype=bool)
+            self._traj = TrajectoryDataset(
+                shm_store,
+                horizon=horizon,
+                pad_before=pad_before,
+                pad_after=pad_after,
+                keys=rgb_keys + lowdim_keys + ["action"],
+                key_first_k=key_first_k,
+                episode_mask=all_ep_mask,
+            )
+            self.train_mask = all_ep_mask
 
     @staticmethod
     def _default_lowdim_spec(key: str) -> str:

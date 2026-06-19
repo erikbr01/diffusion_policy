@@ -183,6 +183,7 @@ task:
       - prepare plate - milk middle
     max_episodes_per_task: 50
     val_ratio: 0.1
+    use_shm: true
   env_runner:
     _target_: diffusion_policy.env_runner.noop_image_runner.NoOpImageRunner
     output_dir: data/outputs/droid/set_table_baseline
@@ -222,7 +223,7 @@ training:
   lr_scheduler: cosine
   lr_warmup_steps: 500
   max_train_steps: null
-  max_val_steps: null
+  max_val_steps: 1
   num_epochs: 3000
   resume: true
   rollout_every: 250
