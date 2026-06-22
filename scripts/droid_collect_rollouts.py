@@ -256,7 +256,15 @@ def main() -> None:
         )
         ep += 1
 
-    logger.info("session written to %s", output_dir)
+    labeled = [s for s in successes if s is not None]
+    if labeled:
+        logger.info(
+            "session complete: %d / %d successful (%.0f%%) — %d unlabeled | written to %s",
+            sum(labeled), len(labeled), 100 * sum(labeled) / len(labeled),
+            len(successes) - len(labeled), output_dir,
+        )
+    else:
+        logger.info("session complete: %d episodes, no labels — written to %s", len(successes), output_dir)
 
 
 if __name__ == "__main__":
