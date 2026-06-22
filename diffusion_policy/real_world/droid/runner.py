@@ -175,6 +175,8 @@ class DROIDInferenceRunner:
         self.policy.submit(obs, instruction)
 
         total_steps = 0
+        # Absolute deadline clock — avoids drift from incremental per-step sleeps.
+        t_next = time.time()
         while total_steps < self.max_timesteps:
             if stop_event is not None and stop_event.is_set():
                 break
@@ -189,7 +191,12 @@ class DROIDInferenceRunner:
             for i in range(horizon):
                 if stop_event is not None and stop_event.is_set():
                     break
-                t0 = time.time()
+                # Sleep until the next absolute deadline, then step.
+                now = time.time()
+                if t_next > now:
+                    time.sleep(t_next - now)
+                t_next += dt
+
                 obs, _, _, _ = self.env.step(chunk[i])
                 total_steps += 1
                 if chunk_embedding is not None:
@@ -200,10 +207,6 @@ class DROIDInferenceRunner:
                 if i == 0:
                     t_submit = time.time()
                     self.policy.submit(obs, instruction)
-
-                elapsed = time.time() - t0
-                if elapsed < dt:
-                    time.sleep(dt - elapsed)
 
         embeddings = np.stack(embedding_rows) if embedding_rows else None
         return self._make_record(
