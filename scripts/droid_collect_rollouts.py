@@ -8,7 +8,7 @@ Output layout::
 
     <output_dir>/
         episodes/metadata.yaml                  per-episode index, length, success
-        recordings/ep{idx:04d}_YYYYMMDDTHHMMSS/
+        recordings/ep_YYYYMMDDTHHMMSS/
             trajectory.h5                       robot state + actions (DROID format)
             wrist_image.mp4                     CRF-18 H.264 at control Hz
             exterior_image_1_left.mp4
@@ -228,7 +228,7 @@ def main() -> None:
             continue
 
         ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
-        ep_dir_name = f"ep{ep:04d}_{ts}"
+        ep_dir_name = f"ep_{ts}"
         ep_dir = recordings / ep_dir_name
         env.save_droid_trajectory(
             ep_dir / "trajectory.h5",
