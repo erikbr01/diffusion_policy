@@ -182,7 +182,12 @@ def main() -> None:
     parser.add_argument("--instruction", default="")
     parser.add_argument("--mode", choices=[m.value for m in InferenceMode],
                         default=InferenceMode.ASYNC_CHUNK.value)
-    parser.add_argument("--open-loop-horizon", type=int, default=4)
+    parser.add_argument("--open-loop-horizon", type=int, default=4,
+                        help="Steady-state open-loop steps between policy queries.")
+    parser.add_argument("--warmup-horizon", type=int, default=16,
+                        help="Open-loop steps per chunk during episode warmup.")
+    parser.add_argument("--warmup-steps", type=int, default=15,
+                        help="Number of steps to stay in warmup mode (default 1s at 15Hz).")
     parser.add_argument("--max-timesteps", type=int, default=600)
     parser.add_argument("--control-hz", type=float, default=15.0)
     parser.add_argument("--device", default="cuda:0")
@@ -205,6 +210,8 @@ def main() -> None:
         policy,
         mode=InferenceMode(args.mode),
         open_loop_horizon=args.open_loop_horizon,
+        warmup_steps=args.warmup_steps,
+        warmup_horizon=args.warmup_horizon,
         max_timesteps=args.max_timesteps,
         control_hz=args.control_hz,
     )
