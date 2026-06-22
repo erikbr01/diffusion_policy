@@ -28,7 +28,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def build_app(checkpoint: str, device: str):
+def build_app(checkpoint: str, device: str, embed_layer: str | None = None):
     """Load the checkpoint and return the Flask app."""
     import numpy as np
     import torch
@@ -47,13 +47,20 @@ def build_app(checkpoint: str, device: str):
     if is_image:
         sm = cfg.task.shape_meta if "task" in cfg else cfg.shape_meta
         shape_meta = OmegaConf.to_container(sm, resolve=True)
+
+    extractor = None
+    if embed_layer is not None:
+        from diffusion_policy.common.policy_embeddings import PolicyEmbeddingExtractor
+        extractor = PolicyEmbeddingExtractor(policy, embed_layer, torch.device(device))
+        logger.info("embedding layer: %s", embed_layer)
+
     logger.info("ready on %s (%s policy)", device, "image" if is_image else "lowdim")
 
     app = Flask(__name__)
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "device": device}
+        return {"status": "ok", "device": device, "embed_layer": embed_layer}
 
     @app.get("/meta")
     def meta():
@@ -64,6 +71,7 @@ def build_app(checkpoint: str, device: str):
             "n_action_steps": int(cfg.n_action_steps),
             "action_dim": int(policy.action_dim),
             "shape_meta": shape_meta,
+            "embed_layer": embed_layer,
         }
 
     @app.post("/infer")
@@ -76,15 +84,37 @@ def build_app(checkpoint: str, device: str):
         with torch.no_grad():
             result = policy.predict_action(batch)
         action = result["action"].detach().cpu().numpy()  # (1, T, action_dim)
+
         buf = io.BytesIO()
-        np.save(buf, action)
+        if extractor is not None:
+            obs_list = [{k: arrays[k][0] for k in arrays.files}]
+            # extractor needs (B, horizon, action_dim); pad short chunk with zeros
+            h = int(cfg.horizon)
+            if action.shape[1] < h:
+                pad = np.zeros(
+                    (action.shape[0], h - action.shape[1], action.shape[2]),
+                    dtype=np.float32,
+                )
+                action_full = np.concatenate([action, pad], axis=1)
+            else:
+                action_full = action
+            embedding = extractor.extract(obs_list, action_batch=action_full, batch_seed=0)
+            np.savez(buf, action=action, embedding=embedding)
+        else:
+            np.savez(buf, action=action)
         return buf.getvalue(), 200, {"Content-Type": "application/octet-stream"}
 
     return app
 
 
-def serve(checkpoint: str, device: str, host: str = "127.0.0.1", port: int = 5001) -> None:
-    app = build_app(checkpoint, device)
+def serve(
+    checkpoint: str,
+    device: str,
+    host: str = "127.0.0.1",
+    port: int = 5001,
+    embed_layer: str | None = None,
+) -> None:
+    app = build_app(checkpoint, device, embed_layer=embed_layer)
     # threaded=False keeps the policy on a single thread (one request at a time).
     app.run(host=host, port=port, threaded=False, use_reloader=False)
 
@@ -95,10 +125,13 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5001)
-    args = parser.parse_args()
+    parser.add_argument("--embed-layer", default=None,
+                        help="Layer to extract embeddings from (e.g. bottleneck_plan_t0). "
+                             "When set, /infer returns action + embedding.")
 
+    args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
-    serve(args.checkpoint, args.device, args.host, args.port)
+    serve(args.checkpoint, args.device, args.host, args.port, embed_layer=args.embed_layer)
 
 
 if __name__ == "__main__":

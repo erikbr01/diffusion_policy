@@ -218,7 +218,11 @@ class DROIDInferenceEnv:
         return data
 
     def save_droid_trajectory(
-        self, path: Path | str, episode_data: List[Dict], success: Optional[bool] = None
+        self,
+        path: Path | str,
+        episode_data: List[Dict],
+        success: Optional[bool] = None,
+        fps: float = 15.0,
     ) -> Path:
         """Save an episode as DROID-format trajectory.h5 via TrajectoryWriter.
 
@@ -232,9 +236,16 @@ class DROIDInferenceEnv:
         writer = writer_mod.TrajectoryWriter(
             str(path), metadata={"success": bool(success)}, save_images=False
         )
+        image_keys = [
+            k for k in ("wrist_image", "exterior_image_1_left", "exterior_image_2_left")
+            if episode_data and k in episode_data[0]["obs"]
+        ]
+        image_buffers: Dict[str, list] = {k: [] for k in image_keys}
         for step in episode_data:
             obs = step["obs"]
             action = step["action"]
+            for k in image_keys:
+                image_buffers[k].append(obs[k])
             timestep = {
                 "observation": {
                     "robot_state": {
@@ -258,6 +269,19 @@ class DROIDInferenceEnv:
             }
             writer.write_timestep(timestep)
         writer.close(metadata={"success": bool(success)})
+
+        # Save per-camera frames as H.264 MP4s alongside trajectory.h5 so
+        # offline embedding extraction can reconstruct any layer later.
+        import imageio
+        for k, frames in image_buffers.items():
+            mp4_path = path.parent / f"{k}.mp4"
+            writer_mp4 = imageio.get_writer(
+                str(mp4_path), fps=int(fps), macro_block_size=1,
+                output_params=["-crf", "18", "-preset", "fast"],
+            )
+            for frame in frames:
+                writer_mp4.append_data(frame)
+            writer_mp4.close()
         return path
 
     # ------------------------------------------------------------------
