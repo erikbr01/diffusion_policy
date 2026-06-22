@@ -31,6 +31,7 @@ def write_metadata(
     output_dir: pathlib.Path,
     lengths: Sequence[int],
     successes: Sequence[Optional[bool]],
+    instruction: str = "",
 ) -> pathlib.Path:
     """Write episodes/metadata.yaml; success entries may be None (null)."""
     if len(lengths) != len(successes):
@@ -38,6 +39,7 @@ def write_metadata(
     episodes_dir = output_dir / "episodes"
     episodes_dir.mkdir(parents=True, exist_ok=True)
     metadata = {
+        "instruction": instruction,
         "episodes": [
             {
                 "index": i,
