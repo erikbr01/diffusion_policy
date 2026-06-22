@@ -75,6 +75,8 @@ class DROIDInferenceRunner:
         mode: InferenceMode = InferenceMode.ASYNC_CHUNK,
         stale_action_policy: StaleActionPolicy = StaleActionPolicy.HOLD_LAST,
         open_loop_horizon: int = 4,
+        warmup_steps: int = 15,
+        warmup_horizon: int = 16,
         max_timesteps: int = 600,
         control_hz: float = 15.0,
     ) -> None:
@@ -83,6 +85,8 @@ class DROIDInferenceRunner:
         self.mode = mode
         self.stale_action_policy = stale_action_policy
         self.open_loop_horizon = open_loop_horizon
+        self.warmup_steps = warmup_steps
+        self.warmup_horizon = warmup_horizon
         self.max_timesteps = max_timesteps
         self.control_hz = control_hz
 
@@ -186,7 +190,13 @@ class DROIDInferenceRunner:
             n_chunks += 1
             chunk_embedding = getattr(self.policy, "last_embedding", None)
 
-            horizon = min(self.open_loop_horizon, len(chunk), self.max_timesteps - total_steps)
+            # Use a longer horizon during warmup so the policy has time to
+            # commit to an action before switching to the reactive steady-state.
+            effective_horizon = (
+                self.warmup_horizon if total_steps < self.warmup_steps
+                else self.open_loop_horizon
+            )
+            horizon = min(effective_horizon, len(chunk), self.max_timesteps - total_steps)
 
             for i in range(horizon):
                 if stop_event is not None and stop_event.is_set():
