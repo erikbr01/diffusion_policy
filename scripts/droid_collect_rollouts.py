@@ -244,11 +244,10 @@ def main() -> None:
         with open(ep_dir / "metadata.yaml", "w") as f:
             yaml.safe_dump({
                 "index": ep,
-                "instruction": args.instruction,
                 "length": record.n_steps,
                 "success": None if success is None else bool(success),
                 "note": note,
-                "embed_layer": args.embed_layer or None,
+                "args": vars(args),
             }, f, sort_keys=False)
         lengths.append(record.n_steps)
         successes.append(success)
