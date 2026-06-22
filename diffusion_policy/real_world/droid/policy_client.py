@@ -219,11 +219,9 @@ class HttpPolicy(_FuturePolicy):
             )
             key_map = resolve_key_map(spec, obs_dict.keys(), self._obs_key_overrides)
             self._window = ObsWindowBuffer(spec, key_map)
-            logger.info("policy server: image policy, obs map %s", key_map)
+            logger.debug("policy server: image policy, obs map %s", key_map)
         else:
-            logger.info(
-                "policy server: lowdim policy, state keys %s", self._state_keys
-            )
+            logger.debug("policy server: lowdim policy, state keys %s", self._state_keys)
 
     def reset(self) -> None:
         super().reset()
