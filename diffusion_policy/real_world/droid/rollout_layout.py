@@ -32,22 +32,26 @@ def write_metadata(
     lengths: Sequence[int],
     successes: Sequence[Optional[bool]],
     instruction: str = "",
+    recording_dirs: Optional[Sequence[str]] = None,
 ) -> pathlib.Path:
     """Write episodes/metadata.yaml; success entries may be None (null)."""
     if len(lengths) != len(successes):
         raise ValueError("lengths and successes must have equal length")
     episodes_dir = output_dir / "episodes"
     episodes_dir.mkdir(parents=True, exist_ok=True)
+    entries = []
+    for i, (n, s) in enumerate(zip(lengths, successes)):
+        entry = {
+            "index": i,
+            "length": int(n),
+            "success": None if s is None else bool(s),
+        }
+        if recording_dirs is not None:
+            entry["recording_dir"] = recording_dirs[i]
+        entries.append(entry)
     metadata = {
         "instruction": instruction,
-        "episodes": [
-            {
-                "index": i,
-                "length": int(n),
-                "success": None if s is None else bool(s),
-            }
-            for i, (n, s) in enumerate(zip(lengths, successes))
-        ]
+        "episodes": entries,
     }
     path = episodes_dir / "metadata.yaml"
     with open(path, "w") as f:

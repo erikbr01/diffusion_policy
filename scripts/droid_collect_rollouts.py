@@ -12,7 +12,7 @@ Output layout::
             trajectory.h5                       robot state + actions (DROID format)
             wrist_image.mp4                     CRF-18 H.264 at control Hz
             exterior_image_1_left.mp4
-        policy_embeddings/<layer>.npz           (n_total_steps, D) float32
+            embeddings_<layer>.npz              (n_steps, D) float32, this episode only
 
 Embeddings are collected online by the policy server (``--embed-layer``).
 MP4s are saved for offline re-extraction of any other layer via
@@ -192,7 +192,7 @@ def main() -> None:
     )
 
     use_tty = sys.stdin.isatty()
-    lengths, successes, notes = [], [], []
+    lengths, successes, notes, recording_dirs = [], [], [], []
     ep = 0
     while ep < args.num_episodes:
         if use_tty:
@@ -228,26 +228,27 @@ def main() -> None:
             continue
 
         ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+        ep_dir_name = f"ep{ep:04d}_{ts}"
+        ep_dir = recordings / ep_dir_name
         env.save_droid_trajectory(
-            recordings / f"ep{ep:04d}_{ts}" / "trajectory.h5",
+            ep_dir / "trajectory.h5",
             episode_data,
             success,
             fps=args.control_hz,
             instruction=args.instruction,
         )
-        if record.embeddings is not None:
-            emb_path = output_dir / "policy_embeddings" / f"{args.embed_layer}.npz"
-            emb_path.parent.mkdir(parents=True, exist_ok=True)
-            if emb_path.exists():
-                prev = np.load(emb_path)["embeddings"]
-                combined = np.concatenate([prev, record.embeddings], axis=0)
-            else:
-                combined = record.embeddings
-            np.savez_compressed(emb_path, embeddings=combined)
+        if record.embeddings is not None and args.embed_layer:
+            emb_path = ep_dir / f"embeddings_{args.embed_layer}.npz"
+            np.savez_compressed(emb_path, embeddings=record.embeddings)
         lengths.append(record.n_steps)
         successes.append(success)
         notes.append(note)
-        write_metadata(output_dir, lengths, successes, instruction=args.instruction)
+        recording_dirs.append(ep_dir_name)
+        write_metadata(
+            output_dir, lengths, successes,
+            instruction=args.instruction,
+            recording_dirs=recording_dirs,
+        )
         logger.info(
             "episode %d: %d steps, %d chunks, %.1f ms avg latency — %s%s",
             ep, record.n_steps, record.n_new_chunks, record.avg_chunk_latency_ms,
