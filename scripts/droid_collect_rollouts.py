@@ -58,7 +58,7 @@ from diffusion_policy.real_world.droid.policy_client import (
     LocalPolicy,
     WebSocketPolicy,
 )
-from diffusion_policy.real_world.droid.rollout_layout import write_metadata
+
 from diffusion_policy.real_world.droid.runner import (
     DROIDInferenceRunner,
     InferenceMode,
@@ -192,7 +192,7 @@ def main() -> None:
     )
 
     use_tty = sys.stdin.isatty()
-    lengths, successes, notes, recording_dirs = [], [], [], []
+    lengths, successes = [], []
     ep = 0
     while ep < args.num_episodes:
         if use_tty:
@@ -240,15 +240,18 @@ def main() -> None:
         if record.embeddings is not None and args.embed_layer:
             emb_path = ep_dir / f"embeddings_{args.embed_layer}.npz"
             np.savez_compressed(emb_path, embeddings=record.embeddings)
+        import yaml
+        with open(ep_dir / "metadata.yaml", "w") as f:
+            yaml.safe_dump({
+                "index": ep,
+                "instruction": args.instruction,
+                "length": record.n_steps,
+                "success": None if success is None else bool(success),
+                "note": note,
+                "embed_layer": args.embed_layer or None,
+            }, f, sort_keys=False)
         lengths.append(record.n_steps)
         successes.append(success)
-        notes.append(note)
-        recording_dirs.append(ep_dir_name)
-        write_metadata(
-            output_dir, lengths, successes,
-            instruction=args.instruction,
-            recording_dirs=recording_dirs,
-        )
         logger.info(
             "episode %d: %d steps, %d chunks, %.1f ms avg latency — %s%s",
             ep, record.n_steps, record.n_new_chunks, record.avg_chunk_latency_ms,
