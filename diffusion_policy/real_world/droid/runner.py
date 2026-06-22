@@ -74,7 +74,7 @@ class DROIDInferenceRunner:
         policy: PolicyBase,
         mode: InferenceMode = InferenceMode.ASYNC_CHUNK,
         stale_action_policy: StaleActionPolicy = StaleActionPolicy.HOLD_LAST,
-        open_loop_horizon: int = 8,
+        open_loop_horizon: int = 4,
         max_timesteps: int = 600,
         control_hz: float = 15.0,
     ) -> None:
