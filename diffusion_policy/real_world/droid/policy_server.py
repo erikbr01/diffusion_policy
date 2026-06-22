@@ -28,7 +28,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def build_app(checkpoint: str, device: str, embed_layer: str | None = None):
+def build_app(checkpoint: str, device: str, embed_layer: str | None = None, num_inference_steps: int | None = None):
     """Load the checkpoint and return the Flask app."""
     import numpy as np
     import torch
@@ -47,6 +47,10 @@ def build_app(checkpoint: str, device: str, embed_layer: str | None = None):
     if is_image:
         sm = cfg.task.shape_meta if "task" in cfg else cfg.shape_meta
         shape_meta = OmegaConf.to_container(sm, resolve=True)
+
+    if num_inference_steps is not None:
+        policy.num_inference_steps = num_inference_steps
+        logger.info("overriding num_inference_steps: %d", num_inference_steps)
 
     extractor = None
     if embed_layer is not None:
@@ -113,8 +117,9 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 5001,
     embed_layer: str | None = None,
+    num_inference_steps: int | None = None,
 ) -> None:
-    app = build_app(checkpoint, device, embed_layer=embed_layer)
+    app = build_app(checkpoint, device, embed_layer=embed_layer, num_inference_steps=num_inference_steps)
     # threaded=False keeps the policy on a single thread (one request at a time).
     app.run(host=host, port=port, threaded=False, use_reloader=False)
 
@@ -128,10 +133,14 @@ def main() -> None:
     parser.add_argument("--embed-layer", default=None,
                         help="Layer to extract embeddings from (e.g. bottleneck_plan_t0). "
                              "When set, /infer returns action + embedding.")
+    parser.add_argument("--num-inference-steps", type=int, default=None,
+                        help="Override diffusion steps at inference (e.g. 16 for DDIM). "
+                             "Defaults to checkpoint value (100 for DDPM).")
 
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
-    serve(args.checkpoint, args.device, args.host, args.port, embed_layer=args.embed_layer)
+    serve(args.checkpoint, args.device, args.host, args.port,
+          embed_layer=args.embed_layer, num_inference_steps=args.num_inference_steps)
 
 
 if __name__ == "__main__":
