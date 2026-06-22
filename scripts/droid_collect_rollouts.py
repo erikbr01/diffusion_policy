@@ -233,6 +233,7 @@ def main() -> None:
             episode_data,
             success,
             fps=args.control_hz,
+            instruction=args.instruction,
         )
         if record.embeddings is not None:
             emb_path = output_dir / "policy_embeddings" / f"{args.embed_layer}.npz"
@@ -246,7 +247,7 @@ def main() -> None:
         lengths.append(record.n_steps)
         successes.append(success)
         notes.append(note)
-        write_metadata(output_dir, lengths, successes)
+        write_metadata(output_dir, lengths, successes, instruction=args.instruction)
         logger.info(
             "episode %d: %d steps, %d chunks, %.1f ms avg latency — %s%s",
             ep, record.n_steps, record.n_new_chunks, record.avg_chunk_latency_ms,

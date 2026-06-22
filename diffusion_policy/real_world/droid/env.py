@@ -223,6 +223,7 @@ class DROIDInferenceEnv:
         episode_data: List[Dict],
         success: Optional[bool] = None,
         fps: float = 15.0,
+        instruction: str = "",
     ) -> Path:
         """Save an episode as DROID-format trajectory.h5 via TrajectoryWriter.
 
@@ -234,7 +235,9 @@ class DROIDInferenceEnv:
 
         writer_mod = _import_droid_module("droid.trajectory_utils.trajectory_writer")
         writer = writer_mod.TrajectoryWriter(
-            str(path), metadata={"success": bool(success)}, save_images=False
+            str(path),
+            metadata={"success": bool(success), "instruction": instruction},
+            save_images=False,
         )
         image_keys = [
             k for k in ("wrist_image", "exterior_image_1_left", "exterior_image_2_left")
