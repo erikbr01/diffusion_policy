@@ -41,8 +41,10 @@ import argparse
 import atexit
 import datetime
 import logging
+import os
 import pathlib
 import select
+import signal
 import sys
 import termios
 import threading
@@ -88,8 +90,14 @@ def _restore_terminal() -> None:
             pass
 
 
+def _quit() -> None:
+    """Restore terminal then send SIGINT to the main thread."""
+    _restore_terminal()
+    os.kill(os.getpid(), signal.SIGINT)
+
+
 def _wait_for_space(prompt: str) -> None:
-    """Block until the user presses space. Terminal is put in raw mode."""
+    """Block until the user presses space. q / Ctrl-C quits. Terminal in raw mode."""
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     print(prompt, flush=True)
@@ -97,14 +105,18 @@ def _wait_for_space(prompt: str) -> None:
         tty.setraw(fd)
         while True:
             r, _, _ = select.select([sys.stdin], [], [], 0.05)
-            if r and sys.stdin.read(1) == " ":
-                return
+            if r:
+                ch = sys.stdin.read(1)
+                if ch == " ":
+                    return
+                if ch in ("q", "\x03"):  # q or Ctrl-C
+                    _quit()
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 def _space_stop_listener(stop_event: threading.Event) -> None:
-    """Watch for space in raw mode; exits cleanly when stop_event is already set."""
+    """Watch for space / q / Ctrl-C in raw mode; exits cleanly when stop_event is set."""
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
@@ -116,6 +128,10 @@ def _space_stop_listener(stop_event: threading.Event) -> None:
                 if ch == " ":
                     print("\r[stop requested]", flush=True)
                     stop_event.set()
+                    return
+                if ch in ("q", "\x03"):  # q or Ctrl-C
+                    stop_event.set()
+                    _quit()
                     return
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
@@ -140,7 +156,9 @@ def _prompt_outcome(episode_idx: int) -> tuple:
             return None, note, False
         if key == "r":
             return None, "", True
-        print("  enter s, f, u, or r")
+        if key == "q":
+            raise SystemExit(0)
+        print("  enter s, f, u, or r (q to quit)")
 
 
 def _build_policy(spec: str, device: str):
@@ -197,7 +215,7 @@ def main() -> None:
     while ep < args.num_episodes:
         if use_tty:
             _wait_for_space(
-                f"\nepisode {ep:04d} / {args.num_episodes} — press SPACE to start"
+                f"\nepisode {ep:04d} / {args.num_episodes} — SPACE to start, q to quit"
             )
 
         stop_event = threading.Event()
