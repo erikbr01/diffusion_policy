@@ -185,6 +185,8 @@ class HttpPolicy(_FuturePolicy):
     np.save bytes of the action chunk (1, T, action_dim).
     """
 
+    last_embedding: Optional[np.ndarray] = None  # (D,) after each get(), None if server has no embed layer
+
     def __init__(
         self,
         url: str = "http://127.0.0.1:5001",
@@ -252,7 +254,15 @@ class HttpPolicy(_FuturePolicy):
         np.savez(buf, **arrays)
         self._submit_fn(self._post, buf.getvalue())
 
-    def _post(self, data: bytes) -> np.ndarray:
+    def get(self) -> np.ndarray:
+        if self._future is None:
+            raise RuntimeError("call submit() before get()")
+        action, embedding = self._future.result()
+        self._future = None
+        self.last_embedding = embedding  # None if server has no embed layer
+        return action
+
+    def _post(self, data: bytes) -> tuple:
         import requests
 
         resp = requests.post(
@@ -262,8 +272,10 @@ class HttpPolicy(_FuturePolicy):
             timeout=self._timeout,
         )
         resp.raise_for_status()
-        action = np.load(io.BytesIO(resp.content))  # (1, T, action_dim)
-        return action[0]
+        arrays = np.load(io.BytesIO(resp.content), allow_pickle=False)
+        action = arrays["action"][0]  # (T, action_dim)
+        embedding = arrays["embedding"][0] if "embedding" in arrays else None  # (D,) or None
+        return action, embedding
 
 
 # ---------------------------------------------------------------------------

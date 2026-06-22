@@ -20,8 +20,9 @@ import numpy as np
 # the live env (values include the env aliases): a checkpoint key resolves to
 # the first available alias.
 KEY_ALIASES: Dict[str, Tuple[str, ...]] = {
-    "hand_camera_image": ("hand_camera_image", "wrist_image"),
-    "wrist_image": ("wrist_image", "hand_camera_image"),
+    "hand_camera_image": ("hand_camera_image", "wrist_image", "wrist_image_left"),
+    "wrist_image": ("wrist_image", "wrist_image_left", "hand_camera_image"),
+    "wrist_image_left": ("wrist_image_left", "wrist_image", "hand_camera_image"),
     "joint_positions": ("joint_positions", "joint_position"),
     "joint_position": ("joint_position", "joint_positions"),
 }

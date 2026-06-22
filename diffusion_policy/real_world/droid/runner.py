@@ -56,6 +56,9 @@ class EpisodeRecord:
     success: Optional[bool]  # real-robot success is annotated externally
     avg_chunk_latency_ms: float
     chunk_latencies_ms: List[float] = field(default_factory=list)
+    # Per-step embeddings if the policy returned them; None otherwise.
+    # Shape (n_steps, D) — each step gets the embedding from its chunk.
+    embeddings: Optional[np.ndarray] = None
 
 
 class DROIDInferenceRunner:
@@ -87,29 +90,47 @@ class DROIDInferenceRunner:
     # Public API
     # ------------------------------------------------------------------
 
-    def run_episode(self, instruction: str = "", episode_idx: int = 0) -> EpisodeRecord:
-        """Run a single rollout and return a summary record."""
+    def run_episode(
+        self,
+        instruction: str = "",
+        episode_idx: int = 0,
+        stop_event: Optional[threading.Event] = None,
+    ) -> EpisodeRecord:
+        """Run a single rollout and return a summary record.
+
+        If *stop_event* is set mid-episode the control loop exits early and
+        returns whatever was collected so far.
+        """
         obs = self.env.reset()
         self.policy.reset()
 
         if self.mode == InferenceMode.SYNC:
-            return self._run_sync(obs, instruction, episode_idx)
+            return self._run_sync(obs, instruction, episode_idx, stop_event)
         if self.mode == InferenceMode.ASYNC_CHUNK:
-            return self._run_async_chunk(obs, instruction, episode_idx)
-        return self._run_async_streaming(obs, instruction, episode_idx)
+            return self._run_async_chunk(obs, instruction, episode_idx, stop_event)
+        return self._run_async_streaming(obs, instruction, episode_idx, stop_event)
 
     # ------------------------------------------------------------------
     # SYNC mode
     # ------------------------------------------------------------------
 
-    def _run_sync(self, obs: dict, instruction: str, episode_idx: int) -> EpisodeRecord:
+    def _run_sync(
+        self,
+        obs: dict,
+        instruction: str,
+        episode_idx: int,
+        stop_event: Optional[threading.Event] = None,
+    ) -> EpisodeRecord:
         dt = 1.0 / self.control_hz
         chunk: Optional[np.ndarray] = None
         chunk_idx = 0
         n_chunks = 0
         latencies: List[float] = []
+        total_steps = 0
 
         for _ in range(self.max_timesteps):
+            if stop_event is not None and stop_event.is_set():
+                break
             t0 = time.time()
 
             if chunk is None or chunk_idx >= self.open_loop_horizon or chunk_idx >= len(chunk):
@@ -123,13 +144,14 @@ class DROIDInferenceRunner:
             action = chunk[chunk_idx]
             chunk_idx += 1
             obs, _, _, _ = self.env.step(action)
+            total_steps += 1
 
             elapsed = time.time() - t0
             if elapsed < dt:
                 time.sleep(dt - elapsed)
 
         return self._make_record(
-            episode_idx, instruction, self.max_timesteps, n_chunks, 0, latencies
+            episode_idx, instruction, total_steps, n_chunks, 0, latencies
         )
 
     # ------------------------------------------------------------------
@@ -137,11 +159,16 @@ class DROIDInferenceRunner:
     # ------------------------------------------------------------------
 
     def _run_async_chunk(
-        self, obs: dict, instruction: str, episode_idx: int
+        self,
+        obs: dict,
+        instruction: str,
+        episode_idx: int,
+        stop_event: Optional[threading.Event] = None,
     ) -> EpisodeRecord:
         dt = 1.0 / self.control_hz
         n_chunks = 0
         latencies: List[float] = []
+        embedding_rows: List[np.ndarray] = []
 
         # Submit the first chunk immediately.
         t_submit = time.time()
@@ -149,17 +176,24 @@ class DROIDInferenceRunner:
 
         total_steps = 0
         while total_steps < self.max_timesteps:
+            if stop_event is not None and stop_event.is_set():
+                break
             # Block for the pending chunk (should already be done when we arrive).
             chunk = self.policy.get()
             latencies.append((time.time() - t_submit) * 1000)
             n_chunks += 1
+            chunk_embedding = getattr(self.policy, "last_embedding", None)
 
             horizon = min(self.open_loop_horizon, len(chunk), self.max_timesteps - total_steps)
 
             for i in range(horizon):
+                if stop_event is not None and stop_event.is_set():
+                    break
                 t0 = time.time()
                 obs, _, _, _ = self.env.step(chunk[i])
                 total_steps += 1
+                if chunk_embedding is not None:
+                    embedding_rows.append(chunk_embedding)
 
                 # Submit the next chunk right after the first step of this one
                 # so inference overlaps with execution of steps 1..horizon-1.
@@ -171,8 +205,9 @@ class DROIDInferenceRunner:
                 if elapsed < dt:
                     time.sleep(dt - elapsed)
 
+        embeddings = np.stack(embedding_rows) if embedding_rows else None
         return self._make_record(
-            episode_idx, instruction, total_steps, n_chunks, 0, latencies
+            episode_idx, instruction, total_steps, n_chunks, 0, latencies, embeddings
         )
 
     # ------------------------------------------------------------------
@@ -180,7 +215,11 @@ class DROIDInferenceRunner:
     # ------------------------------------------------------------------
 
     def _run_async_streaming(
-        self, obs: dict, instruction: str, episode_idx: int
+        self,
+        obs: dict,
+        instruction: str,
+        episode_idx: int,
+        stop_event: Optional[threading.Event] = None,
     ) -> EpisodeRecord:
         dt = 1.0 / self.control_hz
 
@@ -223,6 +262,8 @@ class DROIDInferenceRunner:
 
         try:
             for _ in range(self.max_timesteps):
+                if stop_event is not None and stop_event.is_set():
+                    break
                 t0 = time.time()
 
                 with _lock:
@@ -274,6 +315,7 @@ class DROIDInferenceRunner:
         n_chunks: int,
         n_stale: int,
         latencies: List[float],
+        embeddings: Optional[np.ndarray] = None,
     ) -> EpisodeRecord:
         avg_lat = float(np.mean(latencies)) if latencies else 0.0
         return EpisodeRecord(
@@ -285,4 +327,5 @@ class DROIDInferenceRunner:
             success=None,
             avg_chunk_latency_ms=avg_lat,
             chunk_latencies_ms=list(latencies),
+            embeddings=embeddings,
         )
