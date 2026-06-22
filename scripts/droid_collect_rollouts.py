@@ -182,7 +182,7 @@ def main() -> None:
     parser.add_argument("--instruction", default="")
     parser.add_argument("--mode", choices=[m.value for m in InferenceMode],
                         default=InferenceMode.ASYNC_CHUNK.value)
-    parser.add_argument("--open-loop-horizon", type=int, default=8)
+    parser.add_argument("--open-loop-horizon", type=int, default=4)
     parser.add_argument("--max-timesteps", type=int, default=600)
     parser.add_argument("--control-hz", type=float, default=15.0)
     parser.add_argument("--device", default="cuda:0")
