@@ -202,9 +202,9 @@ class DROIDInferenceRunner:
                 if chunk_embedding is not None:
                     embedding_rows.append(chunk_embedding)
 
-                # Submit on the last step of the chunk so inference overlaps
-                # with exactly one control step while using the freshest obs.
-                if i == horizon - 1:
+                # Submit on the first step of the chunk so inference runs in
+                # the background during steps 1..horizon-1.
+                if i == 0:
                     t_submit = time.time()
                     self.policy.submit(obs, instruction)
 
