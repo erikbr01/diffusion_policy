@@ -244,11 +244,13 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
         import math
         _num_steps = cfg.training.get("num_steps", None) or getattr(cfg.training, "max_global_steps", None)
         _steps_per_epoch = len(train_dataloader)
-        num_epochs_to_run = (
+        total_epochs = (
             math.ceil(_num_steps / _steps_per_epoch)
             if _num_steps is not None
             else cfg.training.num_epochs
         )
+        # only run the remaining epochs so resume doesn't overshoot the target
+        num_epochs_to_run = max(0, total_epochs - self.epoch)
 
         # configure lr scheduler
         lr_scheduler = get_scheduler(
@@ -256,7 +258,7 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
             optimizer=self.optimizer,
             num_warmup_steps=cfg.training.lr_warmup_steps,
             num_training_steps=(
-                (_num_steps if _num_steps is not None else _steps_per_epoch * num_epochs_to_run)
+                (_num_steps if _num_steps is not None else _steps_per_epoch * total_epochs)
                 // cfg.training.gradient_accumulate_every),
             # pytorch assumes stepping LRScheduler every epoch
             # however huggingface diffusers steps it every batch
