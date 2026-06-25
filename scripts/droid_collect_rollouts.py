@@ -69,6 +69,11 @@ def main() -> None:
     parser.add_argument("--open-loop-horizon", type=int, default=8)
     parser.add_argument("--max-timesteps", type=int, default=600)
     parser.add_argument("--control-hz", type=float, default=15.0)
+    parser.add_argument("--action-space", default="joint_velocity",
+                        choices=["joint_velocity", "cartesian_velocity", "joint_position"],
+                        help="Action space the policy was trained with.")
+    parser.add_argument("--position-gain", type=float, default=1.0,
+                        help="Gain for joint_position→velocity conversion (joint_position mode only).")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--extract-embeddings", action="store_true",
                         help="Extract embeddings after collection (local checkpoint only).")
@@ -82,7 +87,12 @@ def main() -> None:
     recordings = output_dir / "recordings"
     recordings.mkdir(parents=True, exist_ok=True)
 
-    env = DROIDInferenceEnv(dry_run=args.dry_run)
+    env = DROIDInferenceEnv(
+        dry_run=args.dry_run,
+        action_space=args.action_space,
+        control_hz=args.control_hz,
+        position_gain=args.position_gain,
+    )
     policy = _build_policy(args.policy, args.device)
     runner = DROIDInferenceRunner(
         env,

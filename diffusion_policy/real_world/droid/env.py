@@ -47,7 +47,12 @@ class DROIDInferenceEnv:
     Parameters
     ----------
     action_space : str
-        'joint_velocity' or 'cartesian_velocity'.
+        'joint_velocity', 'cartesian_velocity', or 'joint_position'.
+        'joint_position' uses a velocity wrapper: at each step the absolute
+        target is converted to joint_velocity via
+        ``(target - current_pos) * control_hz`` and sent to the robot.
+    control_hz : float
+        Control frequency in Hz. Used by the joint_position velocity wrapper.
     wrist_serial, ext1_serial, ext2_serial : str
         ZED serial numbers of the wrist / exterior cameras.
     dry_run : bool
@@ -65,16 +70,20 @@ class DROIDInferenceEnv:
     def __init__(
         self,
         action_space: str = "joint_velocity",
+        control_hz: float = 15.0,
+        position_gain: float = 1.0,
         wrist_serial: str = DEFAULT_WRIST_SERIAL,
         ext1_serial: str = DEFAULT_EXT1_SERIAL,
         ext2_serial: str = DEFAULT_EXT2_SERIAL,
         dry_run: bool = False,
         record_data: bool = True,
     ) -> None:
-        if action_space not in ("joint_velocity", "cartesian_velocity"):
+        if action_space not in ("joint_velocity", "cartesian_velocity", "joint_position"):
             raise ValueError(f"Unknown action_space: {action_space!r}")
 
         self._action_space_name = action_space
+        self._control_hz = control_hz
+        self._position_gain = position_gain
         self.wrist_serial = wrist_serial
         self.ext1_serial = ext1_serial
         self.ext2_serial = ext2_serial
@@ -95,6 +104,11 @@ class DROIDInferenceEnv:
     # Initialisation
     # ------------------------------------------------------------------
 
+    @property
+    def _robot_action_space(self) -> str:
+        # joint_position is implemented as a velocity wrapper on top of joint_velocity
+        return "joint_velocity" if self._action_space_name == "joint_position" else self._action_space_name
+
     def _init_robot(self) -> None:
         robot_env_mod = _import_droid_module("droid.robot_env")
 
@@ -104,7 +118,7 @@ class DROIDInferenceEnv:
             self.ext2_serial: {"image": True},
         }
         self._robot_env = robot_env_mod.RobotEnv(
-            action_space=self._action_space_name,
+            action_space=self._robot_action_space,
             camera_kwargs=camera_kwargs,
             do_reset=True,
         )
@@ -123,13 +137,22 @@ class DROIDInferenceEnv:
         self._last_obs = obs
         return obs
 
+    def _to_robot_action(self, action: np.ndarray, current_obs: Dict) -> np.ndarray:
+        """Convert policy action to the robot's native action space."""
+        if self._action_space_name != "joint_position":
+            return action
+        current_joints = current_obs.get("joint_position", np.zeros(7))
+        velocity = (action[:7] - current_joints) * self._control_hz * self._position_gain
+        return np.concatenate([velocity, action[7:8]], axis=0)
+
     def step(self, action: np.ndarray):
         if self.dry_run:
             obs = self._dummy_obs()
         else:
+            robot_action = self._to_robot_action(action, self._last_obs or {})
             self._robot_env.update_robot(
-                action,
-                action_space=self._action_space_name,
+                robot_action,
+                action_space=self._robot_action_space,
                 gripper_action_space="position",
                 blocking=False,
             )
@@ -251,7 +274,8 @@ class DROIDInferenceEnv:
                     },
                 },
                 "action": {
-                    "joint_velocity": action[:7],
+                    "joint_velocity": action[:7] if self._action_space_name != "joint_position" else np.zeros(7),
+                    "joint_position": action[:7] if self._action_space_name == "joint_position" else np.zeros(7),
                     "gripper_position": float(action[7:8][0]) if len(action) > 7 else 0.0,
                     "cartesian_velocity": np.zeros(6),
                 },

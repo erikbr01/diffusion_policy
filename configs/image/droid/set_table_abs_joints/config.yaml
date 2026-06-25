@@ -182,8 +182,7 @@ task:
     task_filter:
       - prepare plate - milk right
       - prepare plate - milk middle
-    max_episodes_per_task: 50
-    val_ratio: 0.1
+    val_ratio: 0.01
     use_shm: true
   env_runner:
     _target_: diffusion_policy.env_runner.noop_image_runner.NoOpImageRunner
