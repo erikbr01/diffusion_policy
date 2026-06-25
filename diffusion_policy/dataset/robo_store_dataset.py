@@ -187,7 +187,7 @@ def _verify_store_matches_hdf5(store, store_path: str, dataset_path: str) -> Non
 # the datasets' ``normalization`` parameter, e.g.
 #   ++task.dataset.normalization.action=zscore
 #   ++task.dataset.normalization.obs=minmax_p99
-_ABS_ACTION_SPEC = {"per_kind": {"pos": "minmax"}, "default": "none"}
+_ABS_ACTION_SPEC = {"per_kind": {"pos": "minmax", "joints": "minmax"}, "default": "none"}
 _DELTA_ACTION_SPEC = "none"
 _LOWDIM_OBS_CONCAT_SPEC = "max_abs"
 _IMAGE_SPEC = {"method": "fixed_range", "in_range": [0.0, 1.0]}
