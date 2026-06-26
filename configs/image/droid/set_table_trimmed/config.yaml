@@ -1,0 +1,240 @@
+_target_: diffusion_policy.workspace.train_diffusion_unet_hybrid_workspace.TrainDiffusionUnetHybridWorkspace
+
+checkpoint:
+  save_last_ckpt: true
+  save_last_snapshot: false
+  topk:
+    format_str: epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt
+    k: 3
+    mode: max
+    monitor_key: test_mean_score
+
+dataloader:
+  batch_size: 256
+  num_workers: 12
+  persistent_workers: true
+  pin_memory: true
+  shuffle: true
+  prefetch_factor: 4
+
+dataset_obs_steps: 1
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  inv_gamma: 1.0
+  max_value: 0.9999
+  min_value: 0.0
+  power: 0.75
+  update_after_step: 0
+
+exp_name: default
+
+horizon: 16
+keypoint_visible_rate: 1.0
+
+logging:
+  group: null
+  id: null
+  mode: online
+  name: set_table_trimmed
+  project: set-table-droid
+  resume: true
+  tags:
+    - droid
+    - diffusion_policy_cnn
+
+multi_run:
+  run_dir: data/outputs/droid/set_table_trimmed
+  wandb_name_base: set_table_trimmed
+
+n_action_steps: 8
+n_latency_steps: 0
+n_obs_steps: 1
+name: train_diffusion_unet_hybrid
+obs_as_global_cond: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas:
+    - 0.95
+    - 0.999
+  eps: 1.0e-08
+  lr: 0.0002
+  weight_decay: 1.0e-06
+
+past_action_visible: false
+
+policy:
+  _target_: diffusion_policy.policy.diffusion_unet_hybrid_image_policy.DiffusionUnetHybridImagePolicy
+  cond_predict_scale: true
+  crop_shape:
+    - 162
+    - 288
+  diffusion_step_embed_dim: 128
+  down_dims:
+    - 256
+    - 512
+    - 1024
+  eval_fixed_crop: true
+  horizon: 16
+  kernel_size: 5
+  n_action_steps: 8
+  n_groups: 8
+  n_obs_steps: 1
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    beta_start: 0.0001
+    clip_sample: true
+    num_train_timesteps: 100
+    prediction_type: epsilon
+    variance_type: fixed_small
+  num_inference_steps: 100
+  obs_as_global_cond: true
+  obs_encoder_group_norm: true
+  pretrained_backbone: true
+  shape_meta:
+    action:
+      shape:
+        - 8
+    obs:
+      wrist_image_left:
+        shape:
+          - 3
+          - 180
+          - 320
+        type: rgb
+      exterior_image_1_left:
+        shape:
+          - 3
+          - 180
+          - 320
+        type: rgb
+      joint_positions:
+        shape:
+          - 7
+      gripper_position:
+        shape:
+          - 1
+
+shape_meta:
+  action:
+    shape:
+      - 8
+  obs:
+    wrist_image_left:
+      shape:
+        - 3
+        - 180
+        - 320
+      type: rgb
+    exterior_image_1_left:
+      shape:
+        - 3
+        - 180
+        - 320
+      type: rgb
+    joint_positions:
+      shape:
+        - 7
+    gripper_position:
+      shape:
+        - 1
+
+store_path: /mnt/ssdB/erik/droid_converted_trimmed
+
+task:
+  abs_action: false
+  dataset:
+    _target_: diffusion_policy.dataset.robo_store_dataset.RoboStoreImageDataset
+    abs_action: false
+    store_path: /mnt/ssdB/erik/droid_converted_trimmed
+    horizon: 16
+    n_obs_steps: 1
+    pad_after: 7
+    pad_before: 1
+    seed: 42
+    shape_meta:
+      action:
+        shape:
+          - 8
+      obs:
+        wrist_image_left:
+          shape:
+            - 3
+            - 180
+            - 320
+          type: rgb
+        exterior_image_1_left:
+          shape:
+            - 3
+            - 180
+            - 320
+          type: rgb
+        joint_positions:
+          shape:
+            - 7
+        gripper_position:
+          shape:
+            - 1
+    task_filter:
+      - prepare plate - milk right
+      - prepare plate - milk middle
+    val_ratio: 0.01
+    use_shm: true
+  env_runner:
+    _target_: diffusion_policy.env_runner.noop_image_runner.NoOpImageRunner
+    output_dir: data/outputs/droid/set_table_trimmed
+  name: droid
+  shape_meta:
+    action:
+      shape:
+        - 8
+    obs:
+      wrist_image_left:
+        shape:
+          - 3
+          - 180
+          - 320
+        type: rgb
+      exterior_image_1_left:
+        shape:
+          - 3
+          - 180
+          - 320
+        type: rgb
+      joint_positions:
+        shape:
+          - 7
+      gripper_position:
+        shape:
+          - 1
+  task_name: droid
+
+task_name: droid_image
+
+training:
+  checkpoint_every: 50
+  debug: false
+  device: cuda:0
+  gradient_accumulate_every: 1
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  max_train_steps: null
+  max_val_steps: 1
+  num_epochs: 3000
+  resume: true
+  rollout_every: 250
+  sample_every: 50
+  seed: 42
+  tqdm_interval_sec: 1.0
+  use_ema: true
+  val_every: 250
+
+val_dataloader:
+  batch_size: 256
+  num_workers: 4
+  persistent_workers: true
+  pin_memory: true
+  shuffle: false

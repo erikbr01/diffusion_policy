@@ -419,7 +419,23 @@ class _RoboStoreMixin:
         return view
 
     def get_validation_dataset(self):
-        return self._masked_view(self.val_mask)
+        # When use_shm=True the main store is the ShmStore (reindexed 0..N_train-1);
+        # val_mask carries original store indices so we must validate against the
+        # original store saved in _val_store.
+        val_store = getattr(self, "_val_store", self.store)
+        view = copy.copy(self)
+        view._traj = TrajectoryDataset(
+            val_store,
+            horizon=self.horizon,
+            pad_before=self.pad_before,
+            pad_after=self.pad_after,
+            keys=self._keys,
+            key_first_k=self._key_first_k,
+            episode_mask=self.val_mask,
+        )
+        view.train_mask = self.val_mask
+        view.store = val_store
+        return view
 
     def get_holdout_dataset(self):
         return self._masked_view(self.holdout_mask)
@@ -673,8 +689,12 @@ class RoboStoreImageDataset(_RoboStoreMixin, BaseImageDataset):
                 episode_mask=combined,
             )
             self.train_mask = combined
+            self.val_mask = self.val_mask & task_mask
 
         if use_shm:
+            # Keep the original store for validation: ShmStore reindexes episodes
+            # 0..N_train-1, making the original val_mask indices invalid against it.
+            self._val_store = self.store
             shm_store = _load_episodes_into_shm(
                 self.store,
                 self.train_mask,
