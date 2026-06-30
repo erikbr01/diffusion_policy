@@ -861,7 +861,7 @@ setproctitle==1.3.6
     # via
     #   -r requirements.txt
     #   wandb
-setuptools==82.0.1
+setuptools==65.5.0
     # via
     #   dm-control
     #   labmaze
@@ -1051,7 +1051,7 @@ werkzeug==3.1.3
     # via
     #   -r requirements.txt
     #   tensorboard
-wheel==0.47.0
+wheel==0.38.4
     # via tensorboard
 wrapt==2.1.2
     # via
