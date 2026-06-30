@@ -234,7 +234,7 @@ training:
 
 val_dataloader:
   batch_size: 256
-  num_workers: 4
-  persistent_workers: true
+  num_workers: 0
+  persistent_workers: false
   pin_memory: true
   shuffle: false
