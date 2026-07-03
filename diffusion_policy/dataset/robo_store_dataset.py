@@ -80,36 +80,31 @@ def _load_episodes_into_shm(
     """
     from robo_dataset.backends.shm import ShmStore
 
-    ep_ends = source.episode_ends
-    ep_starts = np.concatenate([[0], ep_ends[:-1]])
     selected = np.where(episode_mask)[0]
 
-    ep_lengths = ep_ends[selected] - ep_starts[selected]
-    new_ep_ends = np.cumsum(ep_lengths).astype(np.int64)
+    dtypes: Dict[str, np.dtype] = {k: source.frame_dtype(k) for k in keys}
+    shapes: Dict[str, tuple] = {k: source.frame_shape(k) for k in keys}
 
-    data: Dict[str, torch.Tensor] = {}
-    dtypes: Dict[str, np.dtype] = {}
-    shapes: Dict[str, tuple] = {}
-
-    it = iter(keys)
+    it = selected
     if verbose:
         try:
             from tqdm import tqdm
-            it = tqdm(keys, desc=f"ShmStore: loading {len(selected)} episodes to RAM")
+            it = tqdm(selected, desc=f"ShmStore: loading {len(selected)} episodes to RAM")
         except ImportError:
             pass
 
-    for key in it:
-        chunks = []
-        for ep_idx in selected:
-            chunk = source.get_sequence(key, int(ep_starts[ep_idx]), int(ep_ends[ep_idx]))
-            chunks.append(np.ascontiguousarray(chunk))
-        arr = np.concatenate(chunks, axis=0)
-        dtypes[key] = arr.dtype
-        shapes[key] = source.frame_shape(key)
-        data[key] = torch.from_numpy(arr).share_memory_()
+    # ShmStore holds a per-episode list of {key: tensor}, reindexed 0..N-1.
+    data: List[Dict[str, torch.Tensor]] = []
+    for ep_idx in it:
+        ep_idx = int(ep_idx)
+        ep_len = source.episode_length(ep_idx)
+        ep_tensors: Dict[str, torch.Tensor] = {}
+        for key in keys:
+            arr = np.ascontiguousarray(source.get_frames(ep_idx, key, 0, ep_len))
+            ep_tensors[key] = torch.from_numpy(arr).share_memory_()
+        data.append(ep_tensors)
 
-    return ShmStore(data, new_ep_ends, dtypes, shapes)
+    return ShmStore(data, dtypes, shapes, keys)
 
 
 def _validate_action_schema(schema, abs_action: bool, store_path: str) -> None:
