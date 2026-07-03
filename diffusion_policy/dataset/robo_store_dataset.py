@@ -566,12 +566,15 @@ class RoboStoreLowdimDataset(_RoboStoreMixin, BaseLowdimDataset):
 def _task_episode_mask(
     store_path: str,
     task_filter: Optional[List[str]],
-    max_episodes_per_task: Optional[int],
+    max_episodes_per_task,  # Optional[int | Dict[str, int]]
     n_episodes: int,
+    seed: int = 42,
 ) -> Optional[np.ndarray]:
     if task_filter is None and max_episodes_per_task is None:
         return None
-    import json, pathlib
+    import hashlib
+    import json
+    import pathlib
     tasks_path = pathlib.Path(store_path) / "tasks.json"
     if not tasks_path.exists():
         raise FileNotFoundError(
@@ -579,17 +582,27 @@ def _task_episode_mask(
         )
     with open(tasks_path) as f:
         ep_tasks: dict = json.load(f)
-    mask = np.zeros(n_episodes, dtype=bool)
-    counts: dict = {}
+
+    # Group episodes by task in store order
+    task_to_eps: Dict[str, List[int]] = {}
     for ep_idx in range(n_episodes):
         task = ep_tasks.get(str(ep_idx), "")
         if task_filter is not None and task not in task_filter:
             continue
+        task_to_eps.setdefault(task, []).append(ep_idx)
+
+    mask = np.zeros(n_episodes, dtype=bool)
+    for task, eps in task_to_eps.items():
+        eps_arr = np.array(eps)
         if max_episodes_per_task is not None:
-            if counts.get(task, 0) >= max_episodes_per_task:
-                continue
-            counts[task] = counts.get(task, 0) + 1
-        mask[ep_idx] = True
+            # Seeded shuffle: stable across runs via MD5 of task name + global seed.
+            task_hash = int(hashlib.md5(task.encode()).hexdigest(), 16) & 0xFFFFFFFF
+            np.random.default_rng([seed, task_hash]).shuffle(eps_arr)
+            cap = (max_episodes_per_task.get(task, len(eps))
+                   if hasattr(max_episodes_per_task, "get")
+                   else int(max_episodes_per_task))
+            eps_arr = eps_arr[:cap]
+        mask[eps_arr] = True
     return mask
 
 
@@ -670,7 +683,7 @@ class RoboStoreImageDataset(_RoboStoreMixin, BaseImageDataset):
         )
         if task_filter is not None or max_episodes_per_task is not None:
             task_mask = _task_episode_mask(
-                store_path, task_filter, max_episodes_per_task, self.store.n_episodes
+                store_path, task_filter, max_episodes_per_task, self.store.n_episodes, seed=seed
             )
             from robo_dataset.dataset import TrajectoryDataset
             combined = self.train_mask & task_mask
