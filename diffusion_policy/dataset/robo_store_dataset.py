@@ -572,7 +572,6 @@ def _task_episode_mask(
 ) -> Optional[np.ndarray]:
     if task_filter is None and max_episodes_per_task is None:
         return None
-    import hashlib
     import json
     import pathlib
     tasks_path = pathlib.Path(store_path) / "tasks.json"
@@ -595,13 +594,11 @@ def _task_episode_mask(
     for task, eps in task_to_eps.items():
         eps_arr = np.array(eps)
         if max_episodes_per_task is not None:
-            # Seeded shuffle: stable across runs via MD5 of task name + global seed.
-            task_hash = int(hashlib.md5(task.encode()).hexdigest(), 16) & 0xFFFFFFFF
-            np.random.default_rng([seed, task_hash]).shuffle(eps_arr)
             cap = (max_episodes_per_task.get(task, len(eps))
                    if hasattr(max_episodes_per_task, "get")
                    else int(max_episodes_per_task))
-            eps_arr = eps_arr[:cap]
+            if cap < len(eps_arr):
+                eps_arr = np.random.default_rng(seed).choice(eps_arr, size=cap, replace=False)
         mask[eps_arr] = True
     return mask
 
