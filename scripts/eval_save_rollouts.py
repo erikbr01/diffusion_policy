@@ -285,8 +285,8 @@ def main() -> None:
                         help="Test start seed; episode i uses seed + i.")
     parser.add_argument("--layer", default=DEFAULT_LAYER,
                         help="Policy-embedding layer name (see module docstring).")
-    parser.add_argument("--num-vis", type=int, default=0,
-                        help="Episodes to record as mp4 (-1 = all).")
+    parser.add_argument("--num-vis", type=int, default=-1,
+                        help="Episodes to record as mp4 (-1 = all, default).")
     parser.add_argument("--n-envs", type=int, default=None,
                         help="Parallel envs; default keeps the checkpoint config value.")
     parser.add_argument("--dataset-path", default=None,
