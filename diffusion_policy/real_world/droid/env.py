@@ -53,6 +53,13 @@ class DROIDInferenceEnv:
         ``(target - current_pos) * control_hz`` and sent to the robot.
     control_hz : float
         Control frequency in Hz. Used by the joint_position velocity wrapper.
+    max_joint_velocity : float | None
+        If set and the largest |joint velocity| in a command exceeds this
+        (rad/s), the whole 7-vector is scaled down so it doesn't — preserving
+        the direction of joint motion (and hence Cartesian motion) rather than
+        clipping components independently. Applies to both 'joint_velocity'
+        actions and the 'joint_position' velocity wrapper's derived velocity.
+        None disables scaling.
     wrist_serial, ext1_serial, ext2_serial : str
         ZED serial numbers of the wrist / exterior cameras.
     dry_run : bool
@@ -72,6 +79,7 @@ class DROIDInferenceEnv:
         action_space: str = "joint_velocity",
         control_hz: float = 15.0,
         position_gain: float = 1.0,
+        max_joint_velocity: Optional[float] = None,
         wrist_serial: str = DEFAULT_WRIST_SERIAL,
         ext1_serial: str = DEFAULT_EXT1_SERIAL,
         ext2_serial: str = DEFAULT_EXT2_SERIAL,
@@ -84,6 +92,7 @@ class DROIDInferenceEnv:
         self._action_space_name = action_space
         self._control_hz = control_hz
         self._position_gain = position_gain
+        self._max_joint_velocity = max_joint_velocity
         self.wrist_serial = wrist_serial
         self.ext1_serial = ext1_serial
         self.ext2_serial = ext2_serial
@@ -139,11 +148,31 @@ class DROIDInferenceEnv:
 
     def _to_robot_action(self, action: np.ndarray, current_obs: Dict) -> np.ndarray:
         """Convert policy action to the robot's native action space."""
-        if self._action_space_name != "joint_position":
+        if self._action_space_name == "cartesian_velocity":
             return action
+        if self._action_space_name != "joint_position":
+            return self._clip_joint_velocity(action)
         current_joints = current_obs.get("joint_position", np.zeros(7))
         velocity = (action[:7] - current_joints) * self._control_hz * self._position_gain
+        velocity = self._clip_joint_velocity(velocity)
         return np.concatenate([velocity, action[7:8]], axis=0)
+
+    def _clip_joint_velocity(self, velocity: np.ndarray) -> np.ndarray:
+        """Scale the 7 joint-velocity components (not the trailing gripper one) down
+        so the largest exceeds +/- max_joint_velocity, preserving their direction.
+
+        Clipping each joint independently would change the ratio between joint
+        velocities and, via the Jacobian, distort the Cartesian direction of
+        motion. Scaling the whole vector by one common factor keeps the path
+        the same and only slows it down.
+        """
+        if self._max_joint_velocity is None:
+            return velocity
+        velocity = np.array(velocity, dtype=np.float32, copy=True)
+        peak = np.abs(velocity[:7]).max()
+        if peak > self._max_joint_velocity:
+            velocity[:7] *= self._max_joint_velocity / peak
+        return velocity
 
     def step(self, action: np.ndarray):
         if self.dry_run:
