@@ -248,7 +248,9 @@ class DROIDInferenceRunner:
         _stop = threading.Event()
         latencies: List[float] = []
         n_chunks_ref: List[int] = [0]
-        embedding_rows: List[np.ndarray] = []
+        # One entry per executed step; None until the first chunk/embedding
+        # arrives (kept so the final array stays aligned 1:1 with n_steps).
+        embedding_rows: List[Optional[np.ndarray]] = []
 
         def _inference_thread() -> None:
             while not _stop.is_set():
@@ -307,8 +309,7 @@ class DROIDInferenceRunner:
                     embedding = _last_embedding[0]
                     n_stale += 1
 
-                if embedding is not None:
-                    embedding_rows.append(embedding)
+                embedding_rows.append(embedding)
 
                 new_obs, _, _, _ = self.env.step(action)
                 total_steps += 1
@@ -323,7 +324,7 @@ class DROIDInferenceRunner:
             _stop.set()
             thread.join(timeout=5.0)
 
-        embeddings = np.stack(embedding_rows) if embedding_rows else None
+        embeddings = self._align_embeddings(embedding_rows)
         return self._make_record(
             episode_idx, instruction, total_steps, n_chunks_ref[0], n_stale, latencies, embeddings
         )
@@ -331,6 +332,21 @@ class DROIDInferenceRunner:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _align_embeddings(
+        rows: List[Optional[np.ndarray]],
+    ) -> Optional[np.ndarray]:
+        """Stack per-step embedding rows, zero-filling steps taken before the
+        first policy result arrived (streaming mode only) so the returned
+        array stays aligned 1:1 with n_steps."""
+        if not rows:
+            return None
+        dim = next((r.shape[-1] for r in rows if r is not None), None)
+        if dim is None:
+            return None
+        zero_row = np.zeros(dim, dtype=np.float32)
+        return np.stack([r if r is not None else zero_row for r in rows])
 
     @staticmethod
     def _make_record(
