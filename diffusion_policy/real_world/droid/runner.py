@@ -15,8 +15,12 @@ ASYNC_STREAMING
     A dedicated background thread calls submit → get in a loop, always using
     the latest observation, throttled to at most policy_hz (uncapped if
     policy_hz is None — resubmits back-to-back as fast as the policy
-    allows). The foreground control loop reads from a lock-protected buffer
-    at control_hz; if the buffer is empty (policy slower than the loop),
+    allows). A freshly completed chunk only preempts the one currently
+    executing once min_commit_steps of it have run (0 — the default —
+    preempts immediately, as soon as a new chunk is ready); a chunk that
+    finishes on its own is always swapped for a fresher one immediately.
+    The foreground control loop reads from a lock-protected buffer at
+    control_hz; if the buffer is empty (policy slower than the loop),
     applies the StaleActionPolicy.
 """
 
@@ -87,6 +91,7 @@ class DROIDInferenceRunner:
         max_timesteps: int = 600,
         control_hz: float = 15.0,
         policy_hz: Optional[float] = None,
+        min_commit_steps: int = 0,
     ) -> None:
         self.env = env
         self.policy = policy
@@ -102,6 +107,12 @@ class DROIDInferenceRunner:
         # re-submits back-to-back, as fast as the policy allows — matches
         # prior behavior.
         self.policy_hz = policy_hz
+        # ASYNC_STREAMING only: a freshly completed chunk won't preempt the
+        # one currently executing until at least this many of its steps have
+        # run (0 — default — preempts as soon as a new chunk is ready,
+        # matching prior behavior). Bounds worst-case plan churn regardless
+        # of inference-timing jitter, independent of policy_hz.
+        self.min_commit_steps = min_commit_steps
 
     # ------------------------------------------------------------------
     # Public API
@@ -258,6 +269,12 @@ class DROIDInferenceRunner:
         _last_action: List[Optional[np.ndarray]] = [None]
         _chunk_embedding: List[Optional[np.ndarray]] = [None]
         _last_embedding: List[Optional[np.ndarray]] = [None]
+        # Freshly completed chunks land here first; the foreground loop
+        # promotes them into _buffer once min_commit_steps is satisfied (or
+        # immediately if min_commit_steps is 0, or the current chunk is
+        # exhausted) — see the promotion check below.
+        _pending_buffer: List[Optional[np.ndarray]] = [None]
+        _pending_embedding: List[Optional[np.ndarray]] = [None]
         _stop = threading.Event()
         latencies: List[float] = []
         n_chunks_ref: List[int] = [0]
@@ -283,9 +300,11 @@ class DROIDInferenceRunner:
                 lat_ms = (time.time() - t0) * 1000
                 new_embedding = getattr(self.policy, "last_embedding", None)
                 with _lock:
-                    _buffer[0] = new_chunk
-                    _chunk_step[0] = 0  # latest beats stale: drop unexecuted tail
-                    _chunk_embedding[0] = new_embedding
+                    # Hand off to the foreground loop rather than swapping
+                    # _buffer directly — it decides when min_commit_steps
+                    # lets this preempt the chunk currently executing.
+                    _pending_buffer[0] = new_chunk
+                    _pending_embedding[0] = new_embedding
                     n_chunks_ref[0] += 1
                     latencies.append(lat_ms)
                 # Throttle re-submission so a fast policy doesn't replace the
@@ -309,6 +328,19 @@ class DROIDInferenceRunner:
                 t0 = time.time()
 
                 with _lock:
+                    # Promote a pending chunk once it's allowed to preempt:
+                    # the current chunk is unset/exhausted, or has already
+                    # run for at least min_commit_steps.
+                    if _pending_buffer[0] is not None and (
+                        _buffer[0] is None
+                        or _chunk_step[0] >= len(_buffer[0])
+                        or _chunk_step[0] >= self.min_commit_steps
+                    ):
+                        _buffer[0] = _pending_buffer[0]
+                        _chunk_step[0] = 0
+                        _chunk_embedding[0] = _pending_embedding[0]
+                        _pending_buffer[0] = None
+                        _pending_embedding[0] = None
                     chunk = _buffer[0]
                     idx = _chunk_step[0]
                     embedding = _chunk_embedding[0]

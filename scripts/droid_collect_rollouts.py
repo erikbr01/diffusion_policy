@@ -194,6 +194,12 @@ def main() -> None:
                          help="async_streaming only: caps how often the background "
                               "thread re-submits inference, decoupled from --control-hz. "
                               "Unset re-submits back-to-back, as fast as the policy allows.")
+    parser.add_argument("--min-commit-steps", type=int, default=0,
+                         help="async_streaming only: a freshly completed chunk won't "
+                              "preempt the one currently executing until at least this "
+                              "many of its steps have run. Bounds worst-case plan churn "
+                              "regardless of inference-timing jitter (0 — default — "
+                              "preempts as soon as a new chunk is ready).")
     parser.add_argument("--action-space", default="joint_velocity",
                         choices=["joint_velocity", "cartesian_velocity", "joint_position"],
                         help="Action space the policy was trained with.")
@@ -229,6 +235,7 @@ def main() -> None:
         max_timesteps=args.max_timesteps,
         control_hz=args.control_hz,
         policy_hz=args.policy_hz,
+        min_commit_steps=args.min_commit_steps,
     )
 
     use_tty = sys.stdin.isatty()
