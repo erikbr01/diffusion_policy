@@ -12,10 +12,12 @@ ASYNC_CHUNK
     in the background; block for the new chunk only at the chunk boundary.
 
 ASYNC_STREAMING
-    A dedicated background thread calls submit → get in a tight loop, always
-    using the latest observation. The foreground control loop reads from a
-    lock-protected buffer at control_hz; if the buffer is empty (policy slower
-    than the loop), applies the StaleActionPolicy.
+    A dedicated background thread calls submit → get in a loop, always using
+    the latest observation, throttled to at most policy_hz (uncapped if
+    policy_hz is None — resubmits back-to-back as fast as the policy
+    allows). The foreground control loop reads from a lock-protected buffer
+    at control_hz; if the buffer is empty (policy slower than the loop),
+    applies the StaleActionPolicy.
 """
 
 from __future__ import annotations
@@ -84,6 +86,7 @@ class DROIDInferenceRunner:
         warmup_horizon: int = 16,
         max_timesteps: int = 600,
         control_hz: float = 15.0,
+        policy_hz: Optional[float] = None,
     ) -> None:
         self.env = env
         self.policy = policy
@@ -94,6 +97,11 @@ class DROIDInferenceRunner:
         self.warmup_horizon = warmup_horizon
         self.max_timesteps = max_timesteps
         self.control_hz = control_hz
+        # ASYNC_STREAMING only: caps how often the background thread submits
+        # a new inference request, decoupled from control_hz. None (default)
+        # re-submits back-to-back, as fast as the policy allows — matches
+        # prior behavior.
+        self.policy_hz = policy_hz
 
     # ------------------------------------------------------------------
     # Public API
@@ -258,6 +266,8 @@ class DROIDInferenceRunner:
         # once the episode ends — see n_warmup_steps below.
         embedding_rows: List[Optional[np.ndarray]] = []
 
+        min_submit_period = 1.0 / self.policy_hz if self.policy_hz else 0.0
+
         def _inference_thread() -> None:
             while not _stop.is_set():
                 with _lock:
@@ -278,6 +288,12 @@ class DROIDInferenceRunner:
                     _chunk_embedding[0] = new_embedding
                     n_chunks_ref[0] += 1
                     latencies.append(lat_ms)
+                # Throttle re-submission so a fast policy doesn't replace the
+                # in-flight chunk faster than policy_hz — caps plan churn
+                # independent of control_hz.
+                remaining = min_submit_period - (time.time() - t0)
+                if remaining > 0:
+                    time.sleep(remaining)
 
         thread = threading.Thread(target=_inference_thread, daemon=True, name="droid_infer")
         thread.start()

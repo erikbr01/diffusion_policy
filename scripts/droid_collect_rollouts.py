@@ -190,6 +190,10 @@ def main() -> None:
                         help="Number of steps to stay in warmup mode (default 1s at 15Hz).")
     parser.add_argument("--max-timesteps", type=int, default=600)
     parser.add_argument("--control-hz", type=float, default=15.0)
+    parser.add_argument("--policy-hz", type=float, default=None,
+                         help="async_streaming only: caps how often the background "
+                              "thread re-submits inference, decoupled from --control-hz. "
+                              "Unset re-submits back-to-back, as fast as the policy allows.")
     parser.add_argument("--action-space", default="joint_velocity",
                         choices=["joint_velocity", "cartesian_velocity", "joint_position"],
                         help="Action space the policy was trained with.")
@@ -224,6 +228,7 @@ def main() -> None:
         warmup_horizon=args.warmup_horizon,
         max_timesteps=args.max_timesteps,
         control_hz=args.control_hz,
+        policy_hz=args.policy_hz,
     )
 
     use_tty = sys.stdin.isatty()
