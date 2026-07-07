@@ -337,16 +337,17 @@ class DROIDInferenceRunner:
     def _align_embeddings(
         rows: List[Optional[np.ndarray]],
     ) -> Optional[np.ndarray]:
-        """Stack per-step embedding rows, zero-filling steps taken before the
-        first policy result arrived (streaming mode only) so the returned
-        array stays aligned 1:1 with n_steps."""
+        """Stack per-step embedding rows, marking steps taken before the
+        first policy result arrived (streaming mode only) with NaN so the
+        returned array stays aligned 1:1 with n_steps without fabricating
+        zero-valued embeddings for steps that have none."""
         if not rows:
             return None
         dim = next((r.shape[-1] for r in rows if r is not None), None)
         if dim is None:
             return None
-        zero_row = np.zeros(dim, dtype=np.float32)
-        return np.stack([r if r is not None else zero_row for r in rows])
+        nan_row = np.full(dim, np.nan, dtype=np.float32)
+        return np.stack([r if r is not None else nan_row for r in rows])
 
     @staticmethod
     def _make_record(
