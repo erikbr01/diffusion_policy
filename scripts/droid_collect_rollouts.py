@@ -251,6 +251,11 @@ def main() -> None:
             listener.join(timeout=0.3)  # wait for raw-mode cleanup before prompt
 
         episode_data = env.pop_episode_data()
+        if record.n_warmup_steps:
+            # Steps taken before the first policy result arrived (streaming
+            # mode only) have no embedding — drop them so the persisted
+            # trajectory stays aligned with record.embeddings.
+            episode_data = episode_data[record.n_warmup_steps:]
         env.reset()  # reset immediately so robot goes home while user labels
 
         if use_tty:

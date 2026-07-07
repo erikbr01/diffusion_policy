@@ -59,6 +59,11 @@ class EpisodeRecord:
     # Per-step embeddings if the policy returned them; None otherwise.
     # Shape (n_steps, D) — each step gets the embedding from its chunk.
     embeddings: Optional[np.ndarray] = None
+    # Leading steps taken before the first policy result arrived
+    # (streaming mode only). n_steps/embeddings already exclude these;
+    # the caller must drop the same count from its own step recording
+    # (e.g. env.pop_episode_data()) to stay aligned.
+    n_warmup_steps: int = 0
 
 
 class DROIDInferenceRunner:
@@ -248,8 +253,9 @@ class DROIDInferenceRunner:
         _stop = threading.Event()
         latencies: List[float] = []
         n_chunks_ref: List[int] = [0]
-        # One entry per executed step; None until the first chunk/embedding
-        # arrives (kept so the final array stays aligned 1:1 with n_steps).
+        # One entry per executed step; None for steps taken before the first
+        # policy result arrived. Trimmed (along with those leading steps)
+        # once the episode ends — see n_warmup_steps below.
         embedding_rows: List[Optional[np.ndarray]] = []
 
         def _inference_thread() -> None:
@@ -307,7 +313,10 @@ class DROIDInferenceRunner:
                     else:
                         action = np.zeros(action_dim, dtype=np.float32)
                     embedding = _last_embedding[0]
-                    n_stale += 1
+                    if embedding is not None:
+                        # Buffer momentarily empty after the policy was
+                        # already active — a real stale step, not warmup.
+                        n_stale += 1
 
                 embedding_rows.append(embedding)
 
@@ -324,30 +333,24 @@ class DROIDInferenceRunner:
             _stop.set()
             thread.join(timeout=5.0)
 
-        embeddings = self._align_embeddings(embedding_rows)
+        # Drop the leading steps taken before the first policy result
+        # arrived — no embedding exists for them, so they can't be kept
+        # aligned with the rest of the episode. n_warmup_steps tells the
+        # caller to drop the same count from its own step recording.
+        n_warmup_steps = next(
+            (i for i, r in enumerate(embedding_rows) if r is not None),
+            len(embedding_rows),
+        )
+        active_rows = embedding_rows[n_warmup_steps:]
+        embeddings = np.stack(active_rows) if active_rows else None
         return self._make_record(
-            episode_idx, instruction, total_steps, n_chunks_ref[0], n_stale, latencies, embeddings
+            episode_idx, instruction, total_steps - n_warmup_steps, n_chunks_ref[0],
+            n_stale, latencies, embeddings, n_warmup_steps,
         )
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _align_embeddings(
-        rows: List[Optional[np.ndarray]],
-    ) -> Optional[np.ndarray]:
-        """Stack per-step embedding rows, marking steps taken before the
-        first policy result arrived (streaming mode only) with NaN so the
-        returned array stays aligned 1:1 with n_steps without fabricating
-        zero-valued embeddings for steps that have none."""
-        if not rows:
-            return None
-        dim = next((r.shape[-1] for r in rows if r is not None), None)
-        if dim is None:
-            return None
-        nan_row = np.full(dim, np.nan, dtype=np.float32)
-        return np.stack([r if r is not None else nan_row for r in rows])
 
     @staticmethod
     def _make_record(
@@ -358,6 +361,7 @@ class DROIDInferenceRunner:
         n_stale: int,
         latencies: List[float],
         embeddings: Optional[np.ndarray] = None,
+        n_warmup_steps: int = 0,
     ) -> EpisodeRecord:
         avg_lat = float(np.mean(latencies)) if latencies else 0.0
         return EpisodeRecord(
@@ -370,4 +374,5 @@ class DROIDInferenceRunner:
             avg_chunk_latency_ms=avg_lat,
             chunk_latencies_ms=list(latencies),
             embeddings=embeddings,
+            n_warmup_steps=n_warmup_steps,
         )
