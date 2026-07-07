@@ -243,9 +243,12 @@ class DROIDInferenceRunner:
         _buffer: List[Optional[np.ndarray]] = [None]
         _chunk_step: List[int] = [0]
         _last_action: List[Optional[np.ndarray]] = [None]
+        _chunk_embedding: List[Optional[np.ndarray]] = [None]
+        _last_embedding: List[Optional[np.ndarray]] = [None]
         _stop = threading.Event()
         latencies: List[float] = []
         n_chunks_ref: List[int] = [0]
+        embedding_rows: List[np.ndarray] = []
 
         def _inference_thread() -> None:
             while not _stop.is_set():
@@ -260,9 +263,11 @@ class DROIDInferenceRunner:
                     logger.warning("inference error: %s", e)
                     continue
                 lat_ms = (time.time() - t0) * 1000
+                new_embedding = getattr(self.policy, "last_embedding", None)
                 with _lock:
                     _buffer[0] = new_chunk
                     _chunk_step[0] = 0  # latest beats stale: drop unexecuted tail
+                    _chunk_embedding[0] = new_embedding
                     n_chunks_ref[0] += 1
                     latencies.append(lat_ms)
 
@@ -282,12 +287,14 @@ class DROIDInferenceRunner:
                 with _lock:
                     chunk = _buffer[0]
                     idx = _chunk_step[0]
+                    embedding = _chunk_embedding[0]
 
                 if chunk is not None and idx < len(chunk):
                     action = chunk[idx]
                     with _lock:
                         _chunk_step[0] += 1
                     _last_action[0] = action
+                    _last_embedding[0] = embedding
                 else:
                     # Buffer exhausted or not yet ready.
                     if (
@@ -297,7 +304,11 @@ class DROIDInferenceRunner:
                         action = _last_action[0]
                     else:
                         action = np.zeros(action_dim, dtype=np.float32)
+                    embedding = _last_embedding[0]
                     n_stale += 1
+
+                if embedding is not None:
+                    embedding_rows.append(embedding)
 
                 new_obs, _, _, _ = self.env.step(action)
                 total_steps += 1
@@ -312,8 +323,9 @@ class DROIDInferenceRunner:
             _stop.set()
             thread.join(timeout=5.0)
 
+        embeddings = np.stack(embedding_rows) if embedding_rows else None
         return self._make_record(
-            episode_idx, instruction, total_steps, n_chunks_ref[0], n_stale, latencies
+            episode_idx, instruction, total_steps, n_chunks_ref[0], n_stale, latencies, embeddings
         )
 
     # ------------------------------------------------------------------
