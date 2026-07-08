@@ -200,6 +200,12 @@ def main() -> None:
                               "many of its steps have run. Bounds worst-case plan churn "
                               "regardless of inference-timing jitter (0 — default — "
                               "preempts as soon as a new chunk is ready).")
+    parser.add_argument("--replan-step", type=int, default=0,
+                         help="async_chunk only: submit inference for the next chunk on "
+                              "this step index of the current chunk instead of the start "
+                              "(0 — default). Clamped to the chunk's last step if the "
+                              "chunk is shorter. Delaying gives the policy a fresher "
+                              "observation at the cost of less background inference time.")
     parser.add_argument("--action-space", default="joint_velocity",
                         choices=["joint_velocity", "cartesian_velocity", "joint_position"],
                         help="Action space the policy was trained with.")
@@ -236,6 +242,7 @@ def main() -> None:
         control_hz=args.control_hz,
         policy_hz=args.policy_hz,
         min_commit_steps=args.min_commit_steps,
+        replan_step=args.replan_step,
     )
 
     use_tty = sys.stdin.isatty()

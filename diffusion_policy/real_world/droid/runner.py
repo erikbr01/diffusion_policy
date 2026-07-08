@@ -7,9 +7,12 @@ SYNC
     submit + get() before executing the next chunk.
 
 ASYNC_CHUNK
-    At the start of each chunk, submit inference for the *next* chunk
-    immediately. Execute the current chunk at control_hz while inference runs
-    in the background; block for the new chunk only at the chunk boundary.
+    At step replan_step of each chunk (0 — the default — submits at the
+    start of the chunk), submit inference for the *next* chunk. Execute the
+    current chunk at control_hz while inference runs in the background;
+    block for the new chunk only at the chunk boundary. Delaying
+    replan_step gives the policy a fresher observation to plan from (at the
+    cost of less time for inference to finish before the chunk boundary).
 
 ASYNC_STREAMING
     A dedicated background thread calls submit → get in a loop, always using
@@ -92,6 +95,7 @@ class DROIDInferenceRunner:
         control_hz: float = 15.0,
         policy_hz: Optional[float] = None,
         min_commit_steps: int = 0,
+        replan_step: int = 0,
     ) -> None:
         self.env = env
         self.policy = policy
@@ -102,6 +106,12 @@ class DROIDInferenceRunner:
         self.warmup_horizon = warmup_horizon
         self.max_timesteps = max_timesteps
         self.control_hz = control_hz
+        # ASYNC_CHUNK only: submit inference for the next chunk on this step
+        # index of the current chunk (0 — default — submits at the start,
+        # matching prior behavior, giving inference the whole chunk to run).
+        # Clamped to horizon - 1 per chunk so it always fires even if the
+        # chunk is shorter than replan_step (e.g. the tail of an episode).
+        self.replan_step = replan_step
         # ASYNC_STREAMING only: caps how often the background thread submits
         # a new inference request, decoupled from control_hz. None (default)
         # re-submits back-to-back, as fast as the policy allows — matches
@@ -155,6 +165,8 @@ class DROIDInferenceRunner:
         n_chunks = 0
         latencies: List[float] = []
         total_steps = 0
+        chunk_embedding: Optional[np.ndarray] = None
+        embedding_rows: List[np.ndarray] = []
 
         for _ in range(self.max_timesteps):
             if stop_event is not None and stop_event.is_set():
@@ -168,18 +180,22 @@ class DROIDInferenceRunner:
                 latencies.append((time.time() - t_inf) * 1000)
                 chunk_idx = 0
                 n_chunks += 1
+                chunk_embedding = getattr(self.policy, "last_embedding", None)
 
             action = chunk[chunk_idx]
             chunk_idx += 1
             obs, _, _, _ = self.env.step(action)
             total_steps += 1
+            if chunk_embedding is not None:
+                embedding_rows.append(chunk_embedding)
 
             elapsed = time.time() - t0
             if elapsed < dt:
                 time.sleep(dt - elapsed)
 
+        embeddings = np.stack(embedding_rows) if embedding_rows else None
         return self._make_record(
-            episode_idx, instruction, total_steps, n_chunks, 0, latencies
+            episode_idx, instruction, total_steps, n_chunks, 0, latencies, embeddings
         )
 
     # ------------------------------------------------------------------
@@ -221,6 +237,7 @@ class DROIDInferenceRunner:
                 else self.open_loop_horizon
             )
             horizon = min(effective_horizon, len(chunk), self.max_timesteps - total_steps)
+            replan_step = min(self.replan_step, horizon - 1)
 
             for i in range(horizon):
                 if stop_event is not None and stop_event.is_set():
@@ -236,9 +253,9 @@ class DROIDInferenceRunner:
                 if chunk_embedding is not None:
                     embedding_rows.append(chunk_embedding)
 
-                # Submit on the first step of the chunk so inference runs in
-                # the background during steps 1..horizon-1.
-                if i == 0:
+                # Submit at replan_step so inference runs in the background
+                # for the remainder of the chunk.
+                if i == replan_step:
                     t_submit = time.time()
                     self.policy.submit(obs, instruction)
 
