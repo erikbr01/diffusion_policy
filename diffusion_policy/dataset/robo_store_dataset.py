@@ -569,9 +569,32 @@ def _task_episode_mask(
     max_episodes_per_task,  # Optional[int | Dict[str, int]]
     n_episodes: int,
     seed: int = 42,
+    episodes_per_task: Optional[Dict[str, List[int]]] = None,
 ) -> Optional[np.ndarray]:
-    if task_filter is None and max_episodes_per_task is None:
+    """Build a boolean mask over store episodes.
+
+    If ``episodes_per_task`` is provided (a dict mapping task name -> explicit
+    list of episode indices), those lists are used directly and all other
+    selection parameters are ignored.  This is the preferred mode — it makes
+    the exact training set fully reproducible and auditable from the config.
+    """
+    if task_filter is None and max_episodes_per_task is None and episodes_per_task is None:
         return None
+
+    # --- explicit index mode ---
+    if episodes_per_task is not None:
+        mask = np.zeros(n_episodes, dtype=bool)
+        for task, indices in episodes_per_task.items():
+            for idx in indices:
+                if idx >= n_episodes:
+                    raise ValueError(
+                        f"episodes_per_task['{task}'] contains index {idx} "
+                        f"but store only has {n_episodes} episodes"
+                    )
+                mask[idx] = True
+        return mask
+
+    # --- legacy sampling mode ---
     import json
     import pathlib
     tasks_path = pathlib.Path(store_path) / "tasks.json"
@@ -582,7 +605,6 @@ def _task_episode_mask(
     with open(tasks_path) as f:
         ep_tasks: dict = json.load(f)
 
-    # Group episodes by task in store order
     task_to_eps: Dict[str, List[int]] = {}
     for ep_idx in range(n_episodes):
         task = ep_tasks.get(str(ep_idx), "")
@@ -598,8 +620,6 @@ def _task_episode_mask(
                    if hasattr(max_episodes_per_task, "get")
                    else int(max_episodes_per_task))
             if cap < len(eps_arr):
-                # permutation ensures smaller caps are always a prefix of larger caps
-                # (choice(size=cap) does not guarantee this — different caps produce independent draws)
                 eps_arr = np.random.default_rng(seed).permutation(eps_arr)[:cap]
         mask[eps_arr] = True
     return mask
@@ -639,6 +659,7 @@ class RoboStoreImageDataset(_RoboStoreMixin, BaseImageDataset):
         normalization: Optional[Dict[str, Any]] = None,
         task_filter: Optional[List[str]] = None,
         max_episodes_per_task: Optional[int] = None,
+        episodes_per_task: Optional[Dict[str, List[int]]] = None,
         use_shm: bool = False,
     ):
         rgb_keys, lowdim_keys = [], []
@@ -680,9 +701,10 @@ class RoboStoreImageDataset(_RoboStoreMixin, BaseImageDataset):
             verify_curation_dataset_identity=verify_curation_dataset_identity,
             store_kwargs=store_kwargs,
         )
-        if task_filter is not None or max_episodes_per_task is not None:
+        if task_filter is not None or max_episodes_per_task is not None or episodes_per_task is not None:
             task_mask = _task_episode_mask(
-                store_path, task_filter, max_episodes_per_task, self.store.n_episodes, seed=seed
+                store_path, task_filter, max_episodes_per_task, self.store.n_episodes,
+                seed=seed, episodes_per_task=episodes_per_task,
             )
             from robo_dataset.dataset import TrajectoryDataset
             combined = self.train_mask & task_mask
