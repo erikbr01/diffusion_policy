@@ -598,7 +598,9 @@ def _task_episode_mask(
                    if hasattr(max_episodes_per_task, "get")
                    else int(max_episodes_per_task))
             if cap < len(eps_arr):
-                eps_arr = np.random.default_rng(seed).choice(eps_arr, size=cap, replace=False)
+                # permutation ensures smaller caps are always a prefix of larger caps
+                # (choice(size=cap) does not guarantee this — different caps produce independent draws)
+                eps_arr = np.random.default_rng(seed).permutation(eps_arr)[:cap]
         mask[eps_arr] = True
     return mask
 
