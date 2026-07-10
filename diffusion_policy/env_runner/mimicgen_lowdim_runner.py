@@ -56,9 +56,16 @@ _import_mimicgen_for_robosuite_registry()
 def create_env(env_meta, obs_keys, render_offscreen=False):
     ObsUtils.initialize_obs_modality_mapping_from_dict(
         {'low_dim': obs_keys})
+    # Never draw collision geometry (shows up as semi-transparent green
+    # meshes over the robot) in rendered frames. Make the robosuite defaults
+    # explicit so dataset env_kwargs or version changes can't re-enable it.
+    env_meta['env_kwargs']['render_collision_mesh'] = False
+    env_meta['env_kwargs']['render_visual_mesh'] = True
     env = EnvUtils.create_env_from_metadata(
         env_meta=env_meta,
         render=False,
+        # render_offscreen must be enabled for env.render() to work at all
+        # (robosuite only creates the offscreen GL context when it is set).
         render_offscreen=render_offscreen,
         use_image_obs=False,
     )
@@ -154,7 +161,7 @@ class MimicgenLowdimRunner(BaseLowdimRunner):
             robomimic_env = create_env(
                     env_meta=env_meta,
                     obs_keys=obs_keys,
-                    render_offscreen=(n_test_vis > 0),
+                    render_offscreen=(n_train_vis + n_test_vis > 0),
                 )
             # hard reset doesn't influence lowdim env
             # robomimic_env.env.hard_reset = False
@@ -279,6 +286,7 @@ class MimicgenLowdimRunner(BaseLowdimRunner):
         self.tqdm_interval_sec = tqdm_interval_sec
 
         # save episodes
+        self.n_train_vis = n_train_vis
         self.n_test_vis = n_test_vis
         self.save_episodes = save_episodes
         self.write_rollouts_hdf5 = write_rollouts_hdf5
@@ -301,7 +309,7 @@ class MimicgenLowdimRunner(BaseLowdimRunner):
                 # shared_memory=False: MimicGen uses a custom Box observation space that
                 # AsyncVectorEnv's shared-memory path can't batch ("non-standard Gym
                 # observation spaces ... only compatible with default Gym spaces").
-                if self.n_test_vis > 0:
+                if self.n_train_vis + self.n_test_vis > 0:
                     self.env = SyncVectorEnv(self.env_fns)
                 else:
                     self.env = AsyncVectorEnv(
