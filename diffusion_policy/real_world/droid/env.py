@@ -228,12 +228,13 @@ class DROIDInferenceEnv:
             ),
         }
 
-        for serial, key in (
-            (self.wrist_serial, "wrist_image"),
-            (self.ext1_serial, "exterior_image_1_left"),
-            (self.ext2_serial, "exterior_image_2_left"),
+        for serial, key, view in (
+            (self.wrist_serial, "wrist_image", "left"),
+            (self.wrist_serial, "wrist_image_right", "right"),
+            (self.ext1_serial, "exterior_image_1_left", "left"),
+            (self.ext2_serial, "exterior_image_2_left", "left"),
         ):
-            img = image_obs.get(f"{serial}_left")
+            img = image_obs.get(f"{serial}_{view}")
             if img is not None:
                 obs[key] = self._preprocess_image(img)
 
@@ -256,6 +257,7 @@ class DROIDInferenceEnv:
             "gripper_position": rng.random(1).astype(np.float32),
             "cartesian_position": rng.random(6).astype(np.float32),
             "wrist_image": rng.integers(0, 255, (180, 320, 3), dtype=np.uint8),
+            "wrist_image_right": rng.integers(0, 255, (180, 320, 3), dtype=np.uint8),
             "exterior_image_1_left": rng.integers(0, 255, (180, 320, 3), dtype=np.uint8),
             "exterior_image_2_left": rng.integers(0, 255, (180, 320, 3), dtype=np.uint8),
         }
@@ -292,7 +294,10 @@ class DROIDInferenceEnv:
             save_images=False,
         )
         image_keys = [
-            k for k in ("wrist_image", "exterior_image_1_left", "exterior_image_2_left")
+            k for k in (
+                "wrist_image", "wrist_image_right",
+                "exterior_image_1_left", "exterior_image_2_left",
+            )
             if episode_data and k in episode_data[0]["obs"]
         ]
         image_buffers: Dict[str, list] = {k: [] for k in image_keys}
