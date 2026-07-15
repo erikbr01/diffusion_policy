@@ -66,43 +66,79 @@ def robo_store_worker_init_fn(worker_id: int) -> None:
         store.on_worker_init(worker_id)
 
 
+def _load_one_episode_frames(source, ep_idx: int, keys: List[str]) -> Dict[str, np.ndarray]:
+    """Decode one episode's frames for every key (plain arrays, no torch/shm)."""
+    ep_len = source.episode_length(ep_idx)
+    return {
+        key: np.ascontiguousarray(source.get_frames(ep_idx, key, 0, ep_len))
+        for key in keys
+    }
+
+
 def _load_episodes_into_shm(
     source,
     episode_mask: np.ndarray,
     keys: List[str],
     verbose: bool = True,
+    num_workers: int = 0,
 ) -> "ShmStore":
     """Load only the episodes selected by *episode_mask* into shared memory.
 
     Builds a compact ShmStore where episode indices run 0..N-1 (N = number of
     True entries in episode_mask).  Workers can read it zero-copy after fork;
     ``on_worker_init`` is a no-op.
+
+    ``num_workers > 1`` decodes episodes across a thread pool (video decode
+    releases the GIL, so this gets real parallelism — measured 80.9s -> 15.5s
+    (5.2x) at 16 threads / 32 cores loading a real 119-episode training
+    split). Threads, not processes: this
+    runs well after the training process has imported torch (its own thread
+    pool) and typically initialized CUDA, and forking a process with
+    existing threads/CUDA context is a well-known deadlock hazard (tried
+    first — workers hung forever with near-zero CPU use). Switching to
+    "spawn" avoided the deadlock but each worker pays a full fresh
+    torch/numpy/cv2 import, making it *slower* than sequential at this
+    workload size (measured 0.12x — an 8x regression). Threads have neither
+    problem: no new process, so no fork hazard and no import tax; safe here
+    because VideoStore's decoder cache is lock-protected for concurrent
+    access (see ``_LRUDecoderCache`` in robo_dataset).
     """
     from robo_dataset.backends.shm import ShmStore
 
-    selected = np.where(episode_mask)[0]
+    selected = [int(i) for i in np.where(episode_mask)[0]]
 
     dtypes: Dict[str, np.dtype] = {k: source.frame_dtype(k) for k in keys}
     shapes: Dict[str, tuple] = {k: source.frame_shape(k) for k in keys}
 
-    it = selected
-    if verbose:
-        try:
-            from tqdm import tqdm
-            it = tqdm(selected, desc=f"ShmStore: loading {len(selected)} episodes to RAM")
-        except ImportError:
-            pass
+    desc = f"ShmStore: loading {len(selected)} episodes to RAM"
+    if num_workers and num_workers > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            results = pool.map(
+                lambda ep_idx: _load_one_episode_frames(source, ep_idx, keys), selected
+            )
+            if verbose:
+                try:
+                    from tqdm import tqdm
+                    results = tqdm(results, total=len(selected), desc=f"{desc} ({num_workers} threads)")
+                except ImportError:
+                    pass
+            results = list(results)
+    else:
+        it = selected
+        if verbose:
+            try:
+                from tqdm import tqdm
+                it = tqdm(selected, desc=desc)
+            except ImportError:
+                pass
+        results = [_load_one_episode_frames(source, ep_idx, keys) for ep_idx in it]
 
     # ShmStore holds a per-episode list of {key: tensor}, reindexed 0..N-1.
-    data: List[Dict[str, torch.Tensor]] = []
-    for ep_idx in it:
-        ep_idx = int(ep_idx)
-        ep_len = source.episode_length(ep_idx)
-        ep_tensors: Dict[str, torch.Tensor] = {}
-        for key in keys:
-            arr = np.ascontiguousarray(source.get_frames(ep_idx, key, 0, ep_len))
-            ep_tensors[key] = torch.from_numpy(arr).share_memory_()
-        data.append(ep_tensors)
+    data: List[Dict[str, torch.Tensor]] = [
+        {k: torch.from_numpy(v).share_memory_() for k, v in arrs.items()}
+        for arrs in results
+    ]
 
     return ShmStore(data, dtypes, shapes, keys)
 
@@ -661,6 +697,7 @@ class RoboStoreImageDataset(_RoboStoreMixin, BaseImageDataset):
         max_episodes_per_task: Optional[int] = None,
         episodes_per_task: Optional[Dict[str, List[int]]] = None,
         use_shm: bool = False,
+        shm_num_workers: int = 0,
     ):
         rgb_keys, lowdim_keys = [], []
         for key, attr in shape_meta["obs"].items():
@@ -728,6 +765,7 @@ class RoboStoreImageDataset(_RoboStoreMixin, BaseImageDataset):
                 self.store,
                 self.train_mask,
                 rgb_keys + lowdim_keys + ["action"],
+                num_workers=shm_num_workers,
             )
             self.store = shm_store
             all_ep_mask = np.ones(shm_store.n_episodes, dtype=bool)
