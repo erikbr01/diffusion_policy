@@ -154,14 +154,14 @@ shape_meta:
       shape:
         - 1
 
-store_path: /mnt/ssdB/erik/droid_converted_prepare_tray_trimmed
+store_path: /home/erbauer/policy_graphs/data/droid_converted_prepare_tray_trimmed
 
 task:
   abs_action: false
   dataset:
     _target_: diffusion_policy.dataset.robo_store_dataset.RoboStoreImageDataset
     abs_action: false
-    store_path: /mnt/ssdB/erik/droid_converted_prepare_tray_trimmed
+    store_path: /home/erbauer/policy_graphs/data/droid_converted_prepare_tray_trimmed
     horizon: 16
     n_obs_steps: 1
     pad_after: 7
