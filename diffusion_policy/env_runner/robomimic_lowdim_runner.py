@@ -15,7 +15,7 @@ import math
 import yaml
 import wandb.sdk.data_types.video as wv
 from diffusion_policy.gym_util.async_vector_env import AsyncVectorEnv
-# from diffusion_policy.gym_util.sync_vector_env import SyncVectorEnv
+from diffusion_policy.gym_util.sync_vector_env import SyncVectorEnv
 from diffusion_policy.gym_util.multistep_wrapper import MultiStepWrapper
 from diffusion_policy.gym_util.video_recording_wrapper import VideoRecordingWrapper, VideoRecorder
 from diffusion_policy.model.common.rotation_transformer import RotationTransformer
@@ -31,17 +31,21 @@ import robomimic.utils.obs_utils as ObsUtils
 from diffusion_policy.policy.diffusion_unet_lowdim_policy import DiffusionUnetLowdimPolicy
 
 
-def create_env(env_meta, obs_keys):
+def create_env(env_meta, obs_keys, render_offscreen=False):
     ObsUtils.initialize_obs_modality_mapping_from_dict(
         {'low_dim': obs_keys})
+    # Never draw collision geometry (shows up as semi-transparent green
+    # meshes over the robot) in rendered frames. Make the robosuite defaults
+    # explicit so dataset env_kwargs or version changes can't re-enable it.
+    env_meta['env_kwargs']['render_collision_mesh'] = False
+    env_meta['env_kwargs']['render_visual_mesh'] = True
     env = EnvUtils.create_env_from_metadata(
         env_meta=env_meta,
-        render=False, 
-        # only way to not show collision geometry
-        # is to enable render_offscreen
-        # which uses a lot of RAM.
-        render_offscreen=False,
-        use_image_obs=False, 
+        render=False,
+        # render_offscreen must be enabled for env.render() to work at all
+        # (robosuite only creates the offscreen GL context when it is set).
+        render_offscreen=render_offscreen,
+        use_image_obs=False,
     )
     return env
 
@@ -119,8 +123,9 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
 
         def env_fn():
             robomimic_env = create_env(
-                    env_meta=env_meta, 
-                    obs_keys=obs_keys
+                    env_meta=env_meta,
+                    obs_keys=obs_keys,
+                    render_offscreen=(n_train_vis + n_test_vis > 0),
                 )
             # hard reset doesn't influence lowdim env
             # robomimic_env.env.hard_reset = False
@@ -221,8 +226,12 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
             env_prefixs.append('test/')
             env_init_fn_dills.append(dill.dumps(init_fn))
         
-        env = AsyncVectorEnv(env_fns, shared_memory=False)
-        # env = SyncVectorEnv(env_fns)
+        # Use SyncVectorEnv when offscreen rendering is enabled to avoid EGL
+        # context initialization deadlocks in async worker subprocesses.
+        if n_train_vis + n_test_vis > 0:
+            env = SyncVectorEnv(env_fns)
+        else:
+            env = AsyncVectorEnv(env_fns, shared_memory=False)
 
         self.env_meta = env_meta
         self.env = env

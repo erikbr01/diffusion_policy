@@ -66,50 +66,81 @@ def robo_store_worker_init_fn(worker_id: int) -> None:
         store.on_worker_init(worker_id)
 
 
+def _load_one_episode_frames(source, ep_idx: int, keys: List[str]) -> Dict[str, np.ndarray]:
+    """Decode one episode's frames for every key (plain arrays, no torch/shm)."""
+    ep_len = source.episode_length(ep_idx)
+    return {
+        key: np.ascontiguousarray(source.get_frames(ep_idx, key, 0, ep_len))
+        for key in keys
+    }
+
+
 def _load_episodes_into_shm(
     source,
     episode_mask: np.ndarray,
     keys: List[str],
     verbose: bool = True,
+    num_workers: int = 0,
 ) -> "ShmStore":
     """Load only the episodes selected by *episode_mask* into shared memory.
 
     Builds a compact ShmStore where episode indices run 0..N-1 (N = number of
     True entries in episode_mask).  Workers can read it zero-copy after fork;
     ``on_worker_init`` is a no-op.
+
+    ``num_workers > 1`` decodes episodes across a thread pool (video decode
+    releases the GIL, so this gets real parallelism — measured 80.9s -> 15.5s
+    (5.2x) at 16 threads / 32 cores loading a real 119-episode training
+    split). Threads, not processes: this
+    runs well after the training process has imported torch (its own thread
+    pool) and typically initialized CUDA, and forking a process with
+    existing threads/CUDA context is a well-known deadlock hazard (tried
+    first — workers hung forever with near-zero CPU use). Switching to
+    "spawn" avoided the deadlock but each worker pays a full fresh
+    torch/numpy/cv2 import, making it *slower* than sequential at this
+    workload size (measured 0.12x — an 8x regression). Threads have neither
+    problem: no new process, so no fork hazard and no import tax; safe here
+    because VideoStore's decoder cache is lock-protected for concurrent
+    access (see ``_LRUDecoderCache`` in robo_dataset).
     """
     from robo_dataset.backends.shm import ShmStore
 
-    ep_ends = source.episode_ends
-    ep_starts = np.concatenate([[0], ep_ends[:-1]])
-    selected = np.where(episode_mask)[0]
+    selected = [int(i) for i in np.where(episode_mask)[0]]
 
-    ep_lengths = ep_ends[selected] - ep_starts[selected]
-    new_ep_ends = np.cumsum(ep_lengths).astype(np.int64)
+    dtypes: Dict[str, np.dtype] = {k: source.frame_dtype(k) for k in keys}
+    shapes: Dict[str, tuple] = {k: source.frame_shape(k) for k in keys}
 
-    data: Dict[str, torch.Tensor] = {}
-    dtypes: Dict[str, np.dtype] = {}
-    shapes: Dict[str, tuple] = {}
+    desc = f"ShmStore: loading {len(selected)} episodes to RAM"
+    if num_workers and num_workers > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            results = pool.map(
+                lambda ep_idx: _load_one_episode_frames(source, ep_idx, keys), selected
+            )
+            if verbose:
+                try:
+                    from tqdm import tqdm
+                    results = tqdm(results, total=len(selected), desc=f"{desc} ({num_workers} threads)")
+                except ImportError:
+                    pass
+            results = list(results)
+    else:
+        it = selected
+        if verbose:
+            try:
+                from tqdm import tqdm
+                it = tqdm(selected, desc=desc)
+            except ImportError:
+                pass
+        results = [_load_one_episode_frames(source, ep_idx, keys) for ep_idx in it]
 
-    it = iter(keys)
-    if verbose:
-        try:
-            from tqdm import tqdm
-            it = tqdm(keys, desc=f"ShmStore: loading {len(selected)} episodes to RAM")
-        except ImportError:
-            pass
+    # ShmStore holds a per-episode list of {key: tensor}, reindexed 0..N-1.
+    data: List[Dict[str, torch.Tensor]] = [
+        {k: torch.from_numpy(v).share_memory_() for k, v in arrs.items()}
+        for arrs in results
+    ]
 
-    for key in it:
-        chunks = []
-        for ep_idx in selected:
-            chunk = source.get_sequence(key, int(ep_starts[ep_idx]), int(ep_ends[ep_idx]))
-            chunks.append(np.ascontiguousarray(chunk))
-        arr = np.concatenate(chunks, axis=0)
-        dtypes[key] = arr.dtype
-        shapes[key] = source.frame_shape(key)
-        data[key] = torch.from_numpy(arr).share_memory_()
-
-    return ShmStore(data, new_ep_ends, dtypes, shapes)
+    return ShmStore(data, dtypes, shapes, keys)
 
 
 def _validate_action_schema(schema, abs_action: bool, store_path: str) -> None:
@@ -187,7 +218,7 @@ def _verify_store_matches_hdf5(store, store_path: str, dataset_path: str) -> Non
 # the datasets' ``normalization`` parameter, e.g.
 #   ++task.dataset.normalization.action=zscore
 #   ++task.dataset.normalization.obs=minmax_p99
-_ABS_ACTION_SPEC = {"per_kind": {"pos": "minmax"}, "default": "none"}
+_ABS_ACTION_SPEC = {"per_kind": {"pos": "minmax", "joints": "minmax"}, "default": "none"}
 _DELTA_ACTION_SPEC = "none"
 _LOWDIM_OBS_CONCAT_SPEC = "max_abs"
 _IMAGE_SPEC = {"method": "fixed_range", "in_range": [0.0, 1.0]}
@@ -419,7 +450,23 @@ class _RoboStoreMixin:
         return view
 
     def get_validation_dataset(self):
-        return self._masked_view(self.val_mask)
+        # When use_shm=True the main store is the ShmStore (reindexed 0..N_train-1);
+        # val_mask carries original store indices so we must validate against the
+        # original store saved in _val_store.
+        val_store = getattr(self, "_val_store", self.store)
+        view = copy.copy(self)
+        view._traj = TrajectoryDataset(
+            val_store,
+            horizon=self.horizon,
+            pad_before=self.pad_before,
+            pad_after=self.pad_after,
+            keys=self._keys,
+            key_first_k=self._key_first_k,
+            episode_mask=self.val_mask,
+        )
+        view.train_mask = self.val_mask
+        view.store = val_store
+        return view
 
     def get_holdout_dataset(self):
         return self._masked_view(self.holdout_mask)
@@ -555,12 +602,37 @@ class RoboStoreLowdimDataset(_RoboStoreMixin, BaseLowdimDataset):
 def _task_episode_mask(
     store_path: str,
     task_filter: Optional[List[str]],
-    max_episodes_per_task: Optional[int],
+    max_episodes_per_task,  # Optional[int | Dict[str, int]]
     n_episodes: int,
+    seed: int = 42,
+    episodes_per_task: Optional[Dict[str, List[int]]] = None,
 ) -> Optional[np.ndarray]:
-    if task_filter is None and max_episodes_per_task is None:
+    """Build a boolean mask over store episodes.
+
+    If ``episodes_per_task`` is provided (a dict mapping task name -> explicit
+    list of episode indices), those lists are used directly and all other
+    selection parameters are ignored.  This is the preferred mode — it makes
+    the exact training set fully reproducible and auditable from the config.
+    """
+    if task_filter is None and max_episodes_per_task is None and episodes_per_task is None:
         return None
-    import json, pathlib
+
+    # --- explicit index mode ---
+    if episodes_per_task is not None:
+        mask = np.zeros(n_episodes, dtype=bool)
+        for task, indices in episodes_per_task.items():
+            for idx in indices:
+                if idx >= n_episodes:
+                    raise ValueError(
+                        f"episodes_per_task['{task}'] contains index {idx} "
+                        f"but store only has {n_episodes} episodes"
+                    )
+                mask[idx] = True
+        return mask
+
+    # --- legacy sampling mode ---
+    import json
+    import pathlib
     tasks_path = pathlib.Path(store_path) / "tasks.json"
     if not tasks_path.exists():
         raise FileNotFoundError(
@@ -568,17 +640,24 @@ def _task_episode_mask(
         )
     with open(tasks_path) as f:
         ep_tasks: dict = json.load(f)
-    mask = np.zeros(n_episodes, dtype=bool)
-    counts: dict = {}
+
+    task_to_eps: Dict[str, List[int]] = {}
     for ep_idx in range(n_episodes):
         task = ep_tasks.get(str(ep_idx), "")
         if task_filter is not None and task not in task_filter:
             continue
+        task_to_eps.setdefault(task, []).append(ep_idx)
+
+    mask = np.zeros(n_episodes, dtype=bool)
+    for task, eps in task_to_eps.items():
+        eps_arr = np.array(eps)
         if max_episodes_per_task is not None:
-            if counts.get(task, 0) >= max_episodes_per_task:
-                continue
-            counts[task] = counts.get(task, 0) + 1
-        mask[ep_idx] = True
+            cap = (max_episodes_per_task.get(task, len(eps))
+                   if hasattr(max_episodes_per_task, "get")
+                   else int(max_episodes_per_task))
+            if cap < len(eps_arr):
+                eps_arr = np.random.default_rng(seed).permutation(eps_arr)[:cap]
+        mask[eps_arr] = True
     return mask
 
 
@@ -616,7 +695,9 @@ class RoboStoreImageDataset(_RoboStoreMixin, BaseImageDataset):
         normalization: Optional[Dict[str, Any]] = None,
         task_filter: Optional[List[str]] = None,
         max_episodes_per_task: Optional[int] = None,
+        episodes_per_task: Optional[Dict[str, List[int]]] = None,
         use_shm: bool = False,
+        shm_num_workers: int = 0,
     ):
         rgb_keys, lowdim_keys = [], []
         for key, attr in shape_meta["obs"].items():
@@ -657,9 +738,10 @@ class RoboStoreImageDataset(_RoboStoreMixin, BaseImageDataset):
             verify_curation_dataset_identity=verify_curation_dataset_identity,
             store_kwargs=store_kwargs,
         )
-        if task_filter is not None or max_episodes_per_task is not None:
+        if task_filter is not None or max_episodes_per_task is not None or episodes_per_task is not None:
             task_mask = _task_episode_mask(
-                store_path, task_filter, max_episodes_per_task, self.store.n_episodes
+                store_path, task_filter, max_episodes_per_task, self.store.n_episodes,
+                seed=seed, episodes_per_task=episodes_per_task,
             )
             from robo_dataset.dataset import TrajectoryDataset
             combined = self.train_mask & task_mask
@@ -673,12 +755,17 @@ class RoboStoreImageDataset(_RoboStoreMixin, BaseImageDataset):
                 episode_mask=combined,
             )
             self.train_mask = combined
+            self.val_mask = self.val_mask & task_mask
 
         if use_shm:
+            # Keep the original store for validation: ShmStore reindexes episodes
+            # 0..N_train-1, making the original val_mask indices invalid against it.
+            self._val_store = self.store
             shm_store = _load_episodes_into_shm(
                 self.store,
                 self.train_mask,
                 rgb_keys + lowdim_keys + ["action"],
+                num_workers=shm_num_workers,
             )
             self.store = shm_store
             all_ep_mask = np.ones(shm_store.n_episodes, dtype=bool)

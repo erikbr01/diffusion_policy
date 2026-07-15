@@ -32,7 +32,7 @@ Usage::
         --output-dir /data/rollouts/set_table_jun22 \\
         --instruction "prepare plate - milk right" \\
         --mode async_chunk --control-hz 15 --max-timesteps 600 \\
-        --embed-layer bottleneck_plan_t0
+        --embed-layer bottleneck_plan_t0 --max-joint-velocity 1.0
 """
 
 from __future__ import annotations
@@ -161,6 +161,70 @@ def _prompt_outcome(episode_idx: int) -> tuple:
         print("  enter s, f, u, or r (q to quit)")
 
 
+# droid_robot_ik_solver.RobotIKSolver.max_joint_delta — the per-control-step joint
+# position delta (rad) a normalized joint_velocity command of magnitude 1.0 produces
+# (relative_max_joint_delta = [0.2]*7, see robot_ik_solver.py in the droid stack).
+# Used to reconstruct the commanded *target position* from a velocity command so it
+# can be plotted in the same units as actual proprio. If that constant changes on the
+# robot workstation, update it here too.
+_DROID_JOINT_VELOCITY_DELTA_SCALE = 0.2
+
+
+def _commanded_target_position(actual_positions: np.ndarray, commanded_velocity: np.ndarray) -> np.ndarray:
+    """Reconstruct the per-step commanded joint *target position* (rad) from a
+    joint_velocity command, mirroring franka/robot.py's create_action_dict:
+    joint_delta = joint_velocity_to_delta(command); target = current_position + joint_delta.
+    """
+    cmd = commanded_velocity.copy()
+    peak = np.abs(cmd).max(axis=1, keepdims=True)
+    renorm = peak > 1
+    cmd = np.where(renorm, cmd / np.where(peak == 0, 1, peak), cmd)
+    delta = cmd * _DROID_JOINT_VELOCITY_DELTA_SCALE
+    return actual_positions + delta
+
+
+def _build_joint_tracking_figure(episode_data: list, action_space: str):
+    """Build a per-joint commanded-target-vs-actual-position figure for one episode.
+
+    Both traces are plotted in the same units (rad) on one axis:
+      - 'joint_position' actions already *are* the absolute commanded target.
+      - 'joint_velocity' actions are converted to the implied one-step-ahead
+        target position (see ``_commanded_target_position``), then plotted
+        one timestep later — i.e. compared against where the joint actually
+        was once that command should have taken effect. A persistent gap
+        between the two traces is exactly the overshoot/tracking lag we're
+        trying to diagnose.
+
+    Returns None (and logs why) if there's nothing sensible to plot.
+    """
+    if not episode_data or "cartesian" in action_space:
+        logger.info("skipping joint-tracking plot (no data or non-joint action space)")
+        return None
+
+    import matplotlib.pyplot as plt
+
+    positions = np.stack([step["obs"]["joint_position"] for step in episode_data])  # (T, 7)
+    commanded = np.stack([step["action"][:7] for step in episode_data])  # (T, 7)
+
+    if action_space == "joint_position":
+        target = commanded
+        target_x = np.arange(len(target))
+    else:
+        target = _commanded_target_position(positions, commanded)[:-1]  # last has no "next" to land on
+        target_x = np.arange(1, len(positions))
+
+    fig, axes = plt.subplots(7, 1, figsize=(10, 16), sharex=True)
+    for j, ax in enumerate(axes):
+        ax.plot(positions[:, j], color="tab:blue", label="actual position (rad)")
+        ax.plot(target_x, target[:, j], color="tab:orange", linestyle="--", label="commanded target (rad)")
+        ax.set_ylabel(f"joint {j}")
+    axes[0].legend(loc="upper right")
+    axes[-1].set_xlabel("timestep")
+    fig.suptitle(f"commanded target vs. actual position — {action_space}")
+    fig.tight_layout()
+    return fig
+
+
 def _build_policy(spec: str, device: str):
     """``http://...`` | ``ws://...`` | a local checkpoint path."""
     if spec.startswith("http://") or spec.startswith("https://"):
@@ -211,12 +275,21 @@ def main() -> None:
                         help="Action space the policy was trained with.")
     parser.add_argument("--position-gain", type=float, default=1.0,
                         help="Gain for joint_position→velocity conversion (joint_position mode only).")
+    parser.add_argument("--max-joint-velocity", type=float, default=None,
+                        help="If the largest |joint velocity| in a command exceeds this (rad/s), "
+                             "scale the whole velocity vector down to preserve direction "
+                             "(Cartesian path unchanged, just slower) rather than clipping "
+                             "components independently. Applies to joint_velocity and "
+                             "joint_position (converted) actions. Unset disables scaling.")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--embed-layer", default="bottleneck_plan_t0",
                         help="Embedding layer to extract online via the policy server "
                              "(pass to --embed-layer on the server). Set to '' to disable.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Synthetic observations instead of robot hardware.")
+    parser.add_argument("--plot-actions", action="store_true",
+                        help="Save a per-joint commanded-vs-actual plot (joint_tracking.png) "
+                             "in each episode's recording dir after it finishes.")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
@@ -229,6 +302,7 @@ def main() -> None:
         action_space=args.action_space,
         control_hz=args.control_hz,
         position_gain=args.position_gain,
+        max_joint_velocity=args.max_joint_velocity,
     )
     policy = _build_policy(args.policy, args.device)
     runner = DROIDInferenceRunner(
@@ -277,12 +351,22 @@ def main() -> None:
             episode_data = episode_data[record.n_warmup_steps:]
         env.reset()  # reset immediately so robot goes home while user labels
 
+        tracking_fig = None
+        if args.plot_actions:
+            import matplotlib.pyplot as plt
+            tracking_fig = _build_joint_tracking_figure(episode_data, args.action_space)
+            if tracking_fig is not None:
+                plt.show()  # blocks until closed — inspect before labeling the outcome
+
         if use_tty:
             success, note, retry = _prompt_outcome(ep)
         else:
             success, note, retry = None, "", False
 
         if retry:
+            if tracking_fig is not None:
+                import matplotlib.pyplot as plt
+                plt.close(tracking_fig)
             logger.info("episode %d: retrying (not saved)", ep)
             continue
 
@@ -299,6 +383,11 @@ def main() -> None:
         if record.embeddings is not None and args.embed_layer:
             emb_path = ep_dir / f"embeddings_{args.embed_layer}.npz"
             np.savez_compressed(emb_path, embeddings=record.embeddings)
+        if tracking_fig is not None:
+            import matplotlib.pyplot as plt
+            tracking_fig.savefig(ep_dir / "joint_tracking.png", dpi=120)
+            plt.close(tracking_fig)
+            logger.info("wrote joint-tracking plot to %s", ep_dir / "joint_tracking.png")
         import yaml
         with open(ep_dir / "metadata.yaml", "w") as f:
             yaml.safe_dump({
