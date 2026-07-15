@@ -105,6 +105,12 @@ policy:
           - 180
           - 320
         type: rgb
+      wrist_image_right:
+        shape:
+          - 3
+          - 180
+          - 320
+        type: rgb
       exterior_image_1_left:
         shape:
           - 3
@@ -124,6 +130,12 @@ shape_meta:
       - 8
   obs:
     wrist_image_left:
+      shape:
+        - 3
+        - 180
+        - 320
+      type: rgb
+    wrist_image_right:
       shape:
         - 3
         - 180
@@ -166,6 +178,12 @@ task:
             - 180
             - 320
           type: rgb
+        wrist_image_right:
+          shape:
+            - 3
+            - 180
+            - 320
+          type: rgb
         exterior_image_1_left:
           shape:
             - 3
@@ -195,6 +213,12 @@ task:
         - 8
     obs:
       wrist_image_left:
+        shape:
+          - 3
+          - 180
+          - 320
+        type: rgb
+      wrist_image_right:
         shape:
           - 3
           - 180
