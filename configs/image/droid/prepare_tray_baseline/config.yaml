@@ -3,11 +3,15 @@ _target_: diffusion_policy.workspace.train_diffusion_unet_hybrid_workspace.Train
 checkpoint:
   save_last_ckpt: true
   save_last_snapshot: false
+  # No meaningful eval metric for DROID (no sim rollouts), so use topk as an
+  # "every checkpoint_every epochs, keep it" mechanism: monitor `epoch`, mode
+  # max, k large enough that no save ever gets evicted (num_epochs=3000 /
+  # checkpoint_every=100 = 30 saves).
   topk:
-    format_str: epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt
-    k: 3
+    format_str: epoch={epoch:04d}.ckpt
+    k: 30
     mode: max
-    monitor_key: test_mean_score
+    monitor_key: epoch
 
 dataloader:
   batch_size: 256
@@ -241,7 +245,7 @@ task:
 task_name: droid_image
 
 training:
-  checkpoint_every: 50
+  checkpoint_every: 100
   debug: false
   device: cuda:0
   gradient_accumulate_every: 1
