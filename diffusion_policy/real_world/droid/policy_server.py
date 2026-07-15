@@ -17,6 +17,13 @@ POST /infer    body: np.savez bytes, one array per obs key, each (1, To, ...);
 Usage:
     python -m diffusion_policy.real_world.droid.policy_server \
         --checkpoint /path/to/latest.ckpt --device cuda:0 --port 5001
+
+Pass --compile to torch.compile the obs_encoder/model sub-modules (same helper
+``train_diffusion_unet_hybrid_workspace.py`` uses for training). This pays the
+compilation cost (tens of seconds) once at startup via a warmup call with
+dummy inputs, rather than on the first real /infer request. Only worthwhile
+if requests reuse a fixed obs window shape, since a new shape triggers
+recompilation (dynamic=False).
 """
 
 from __future__ import annotations
@@ -28,13 +35,22 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def build_app(checkpoint: str, device: str, embed_layer: str | None = None, num_inference_steps: int | None = None):
+def build_app(
+    checkpoint: str,
+    device: str,
+    embed_layer: str | None = None,
+    num_inference_steps: int | None = None,
+    compile: bool = False,
+):
     """Load the checkpoint and return the Flask app."""
+    import time
+
     import numpy as np
     import torch
     from flask import Flask, request
     from omegaconf import OmegaConf
 
+    from diffusion_policy.common.ddp_util import compile_policy
     from diffusion_policy.common.trak_util import get_policy_from_checkpoint
     from diffusion_policy.policy.diffusion_unet_hybrid_image_policy import (
         DiffusionUnetHybridImagePolicy,
@@ -52,6 +68,22 @@ def build_app(checkpoint: str, device: str, embed_layer: str | None = None, num_
         policy.num_inference_steps = num_inference_steps
         logger.info("overriding num_inference_steps: %d", num_inference_steps)
 
+    if compile:
+        compile_policy(policy)
+        logger.info("compiling (warmup call, this can take ~10s)...")
+        n_obs_steps = int(cfg.n_obs_steps)
+        if is_image:
+            dummy_batch = {
+                key: torch.rand(1, n_obs_steps, *spec["shape"], device=device)
+                for key, spec in shape_meta["obs"].items()
+            }
+        else:
+            dummy_batch = {"obs": torch.rand(1, n_obs_steps, policy.obs_dim, device=device)}
+        t0 = time.time()
+        with torch.no_grad():
+            policy.predict_action(dummy_batch)
+        logger.info("compile warmup done in %.1fs", time.time() - t0)
+
     extractor = None
     if embed_layer is not None:
         from diffusion_policy.common.policy_embeddings import PolicyEmbeddingExtractor
@@ -64,7 +96,7 @@ def build_app(checkpoint: str, device: str, embed_layer: str | None = None, num_
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "device": device, "embed_layer": embed_layer}
+        return {"status": "ok", "device": device, "embed_layer": embed_layer, "compiled": compile}
 
     @app.get("/meta")
     def meta():
@@ -118,8 +150,15 @@ def serve(
     port: int = 5001,
     embed_layer: str | None = None,
     num_inference_steps: int | None = None,
+    compile: bool = False,
 ) -> None:
-    app = build_app(checkpoint, device, embed_layer=embed_layer, num_inference_steps=num_inference_steps)
+    app = build_app(
+        checkpoint,
+        device,
+        embed_layer=embed_layer,
+        num_inference_steps=num_inference_steps,
+        compile=compile,
+    )
     # threaded=False keeps the policy on a single thread (one request at a time).
     app.run(host=host, port=port, threaded=False, use_reloader=False)
 
@@ -136,11 +175,16 @@ def main() -> None:
     parser.add_argument("--num-inference-steps", type=int, default=None,
                         help="Override diffusion steps at inference (e.g. 16 for DDIM). "
                              "Defaults to checkpoint value (100 for DDPM).")
+    parser.add_argument("--compile", action="store_true",
+                        help="torch.compile the obs_encoder/model sub-modules and warm up "
+                             "the compiled graph at startup (adds ~10s to startup, speeds up "
+                             "steady-state /infer calls).")
 
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
     serve(args.checkpoint, args.device, args.host, args.port,
-          embed_layer=args.embed_layer, num_inference_steps=args.num_inference_steps)
+          embed_layer=args.embed_layer, num_inference_steps=args.num_inference_steps,
+          compile=args.compile)
 
 
 if __name__ == "__main__":

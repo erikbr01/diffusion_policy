@@ -7,15 +7,24 @@ SYNC
     submit + get() before executing the next chunk.
 
 ASYNC_CHUNK
-    At the start of each chunk, submit inference for the *next* chunk
-    immediately. Execute the current chunk at control_hz while inference runs
-    in the background; block for the new chunk only at the chunk boundary.
+    At step replan_step of each chunk (0 — the default — submits at the
+    start of the chunk), submit inference for the *next* chunk. Execute the
+    current chunk at control_hz while inference runs in the background;
+    block for the new chunk only at the chunk boundary. Delaying
+    replan_step gives the policy a fresher observation to plan from (at the
+    cost of less time for inference to finish before the chunk boundary).
 
 ASYNC_STREAMING
-    A dedicated background thread calls submit → get in a tight loop, always
-    using the latest observation. The foreground control loop reads from a
-    lock-protected buffer at control_hz; if the buffer is empty (policy slower
-    than the loop), applies the StaleActionPolicy.
+    A dedicated background thread calls submit → get in a loop, always using
+    the latest observation, throttled to at most policy_hz (uncapped if
+    policy_hz is None — resubmits back-to-back as fast as the policy
+    allows). A freshly completed chunk only preempts the one currently
+    executing once min_commit_steps of it have run (0 — the default —
+    preempts immediately, as soon as a new chunk is ready); a chunk that
+    finishes on its own is always swapped for a fresher one immediately.
+    The foreground control loop reads from a lock-protected buffer at
+    control_hz; if the buffer is empty (policy slower than the loop),
+    applies the StaleActionPolicy.
 """
 
 from __future__ import annotations
@@ -59,6 +68,11 @@ class EpisodeRecord:
     # Per-step embeddings if the policy returned them; None otherwise.
     # Shape (n_steps, D) — each step gets the embedding from its chunk.
     embeddings: Optional[np.ndarray] = None
+    # Leading steps taken before the first policy result arrived
+    # (streaming mode only). n_steps/embeddings already exclude these;
+    # the caller must drop the same count from its own step recording
+    # (e.g. env.pop_episode_data()) to stay aligned.
+    n_warmup_steps: int = 0
 
 
 class DROIDInferenceRunner:
@@ -79,6 +93,9 @@ class DROIDInferenceRunner:
         warmup_horizon: int = 16,
         max_timesteps: int = 600,
         control_hz: float = 15.0,
+        policy_hz: Optional[float] = None,
+        min_commit_steps: int = 0,
+        replan_step: int = 0,
     ) -> None:
         self.env = env
         self.policy = policy
@@ -89,6 +106,23 @@ class DROIDInferenceRunner:
         self.warmup_horizon = warmup_horizon
         self.max_timesteps = max_timesteps
         self.control_hz = control_hz
+        # ASYNC_CHUNK only: submit inference for the next chunk on this step
+        # index of the current chunk (0 — default — submits at the start,
+        # matching prior behavior, giving inference the whole chunk to run).
+        # Clamped to horizon - 1 per chunk so it always fires even if the
+        # chunk is shorter than replan_step (e.g. the tail of an episode).
+        self.replan_step = replan_step
+        # ASYNC_STREAMING only: caps how often the background thread submits
+        # a new inference request, decoupled from control_hz. None (default)
+        # re-submits back-to-back, as fast as the policy allows — matches
+        # prior behavior.
+        self.policy_hz = policy_hz
+        # ASYNC_STREAMING only: a freshly completed chunk won't preempt the
+        # one currently executing until at least this many of its steps have
+        # run (0 — default — preempts as soon as a new chunk is ready,
+        # matching prior behavior). Bounds worst-case plan churn regardless
+        # of inference-timing jitter, independent of policy_hz.
+        self.min_commit_steps = min_commit_steps
 
     # ------------------------------------------------------------------
     # Public API
@@ -131,6 +165,8 @@ class DROIDInferenceRunner:
         n_chunks = 0
         latencies: List[float] = []
         total_steps = 0
+        chunk_embedding: Optional[np.ndarray] = None
+        embedding_rows: List[np.ndarray] = []
 
         for _ in range(self.max_timesteps):
             if stop_event is not None and stop_event.is_set():
@@ -144,18 +180,22 @@ class DROIDInferenceRunner:
                 latencies.append((time.time() - t_inf) * 1000)
                 chunk_idx = 0
                 n_chunks += 1
+                chunk_embedding = getattr(self.policy, "last_embedding", None)
 
             action = chunk[chunk_idx]
             chunk_idx += 1
             obs, _, _, _ = self.env.step(action)
             total_steps += 1
+            if chunk_embedding is not None:
+                embedding_rows.append(chunk_embedding)
 
             elapsed = time.time() - t0
             if elapsed < dt:
                 time.sleep(dt - elapsed)
 
+        embeddings = np.stack(embedding_rows) if embedding_rows else None
         return self._make_record(
-            episode_idx, instruction, total_steps, n_chunks, 0, latencies
+            episode_idx, instruction, total_steps, n_chunks, 0, latencies, embeddings
         )
 
     # ------------------------------------------------------------------
@@ -197,6 +237,7 @@ class DROIDInferenceRunner:
                 else self.open_loop_horizon
             )
             horizon = min(effective_horizon, len(chunk), self.max_timesteps - total_steps)
+            replan_step = min(self.replan_step, horizon - 1)
 
             for i in range(horizon):
                 if stop_event is not None and stop_event.is_set():
@@ -212,9 +253,9 @@ class DROIDInferenceRunner:
                 if chunk_embedding is not None:
                     embedding_rows.append(chunk_embedding)
 
-                # Submit on the first step of the chunk so inference runs in
-                # the background during steps 1..horizon-1.
-                if i == 0:
+                # Submit at replan_step so inference runs in the background
+                # for the remainder of the chunk.
+                if i == replan_step:
                     t_submit = time.time()
                     self.policy.submit(obs, instruction)
 
@@ -243,9 +284,23 @@ class DROIDInferenceRunner:
         _buffer: List[Optional[np.ndarray]] = [None]
         _chunk_step: List[int] = [0]
         _last_action: List[Optional[np.ndarray]] = [None]
+        _chunk_embedding: List[Optional[np.ndarray]] = [None]
+        _last_embedding: List[Optional[np.ndarray]] = [None]
+        # Freshly completed chunks land here first; the foreground loop
+        # promotes them into _buffer once min_commit_steps is satisfied (or
+        # immediately if min_commit_steps is 0, or the current chunk is
+        # exhausted) — see the promotion check below.
+        _pending_buffer: List[Optional[np.ndarray]] = [None]
+        _pending_embedding: List[Optional[np.ndarray]] = [None]
         _stop = threading.Event()
         latencies: List[float] = []
         n_chunks_ref: List[int] = [0]
+        # One entry per executed step; None for steps taken before the first
+        # policy result arrived. Trimmed (along with those leading steps)
+        # once the episode ends — see n_warmup_steps below.
+        embedding_rows: List[Optional[np.ndarray]] = []
+
+        min_submit_period = 1.0 / self.policy_hz if self.policy_hz else 0.0
 
         def _inference_thread() -> None:
             while not _stop.is_set():
@@ -260,11 +315,21 @@ class DROIDInferenceRunner:
                     logger.warning("inference error: %s", e)
                     continue
                 lat_ms = (time.time() - t0) * 1000
+                new_embedding = getattr(self.policy, "last_embedding", None)
                 with _lock:
-                    _buffer[0] = new_chunk
-                    _chunk_step[0] = 0  # latest beats stale: drop unexecuted tail
+                    # Hand off to the foreground loop rather than swapping
+                    # _buffer directly — it decides when min_commit_steps
+                    # lets this preempt the chunk currently executing.
+                    _pending_buffer[0] = new_chunk
+                    _pending_embedding[0] = new_embedding
                     n_chunks_ref[0] += 1
                     latencies.append(lat_ms)
+                # Throttle re-submission so a fast policy doesn't replace the
+                # in-flight chunk faster than policy_hz — caps plan churn
+                # independent of control_hz.
+                remaining = min_submit_period - (time.time() - t0)
+                if remaining > 0:
+                    time.sleep(remaining)
 
         thread = threading.Thread(target=_inference_thread, daemon=True, name="droid_infer")
         thread.start()
@@ -280,14 +345,29 @@ class DROIDInferenceRunner:
                 t0 = time.time()
 
                 with _lock:
+                    # Promote a pending chunk once it's allowed to preempt:
+                    # the current chunk is unset/exhausted, or has already
+                    # run for at least min_commit_steps.
+                    if _pending_buffer[0] is not None and (
+                        _buffer[0] is None
+                        or _chunk_step[0] >= len(_buffer[0])
+                        or _chunk_step[0] >= self.min_commit_steps
+                    ):
+                        _buffer[0] = _pending_buffer[0]
+                        _chunk_step[0] = 0
+                        _chunk_embedding[0] = _pending_embedding[0]
+                        _pending_buffer[0] = None
+                        _pending_embedding[0] = None
                     chunk = _buffer[0]
                     idx = _chunk_step[0]
+                    embedding = _chunk_embedding[0]
 
                 if chunk is not None and idx < len(chunk):
                     action = chunk[idx]
                     with _lock:
                         _chunk_step[0] += 1
                     _last_action[0] = action
+                    _last_embedding[0] = embedding
                 else:
                     # Buffer exhausted or not yet ready.
                     if (
@@ -297,7 +377,13 @@ class DROIDInferenceRunner:
                         action = _last_action[0]
                     else:
                         action = np.zeros(action_dim, dtype=np.float32)
-                    n_stale += 1
+                    embedding = _last_embedding[0]
+                    if embedding is not None:
+                        # Buffer momentarily empty after the policy was
+                        # already active — a real stale step, not warmup.
+                        n_stale += 1
+
+                embedding_rows.append(embedding)
 
                 new_obs, _, _, _ = self.env.step(action)
                 total_steps += 1
@@ -312,8 +398,19 @@ class DROIDInferenceRunner:
             _stop.set()
             thread.join(timeout=5.0)
 
+        # Drop the leading steps taken before the first policy result
+        # arrived — no embedding exists for them, so they can't be kept
+        # aligned with the rest of the episode. n_warmup_steps tells the
+        # caller to drop the same count from its own step recording.
+        n_warmup_steps = next(
+            (i for i, r in enumerate(embedding_rows) if r is not None),
+            len(embedding_rows),
+        )
+        active_rows = embedding_rows[n_warmup_steps:]
+        embeddings = np.stack(active_rows) if active_rows else None
         return self._make_record(
-            episode_idx, instruction, total_steps, n_chunks_ref[0], n_stale, latencies
+            episode_idx, instruction, total_steps - n_warmup_steps, n_chunks_ref[0],
+            n_stale, latencies, embeddings, n_warmup_steps,
         )
 
     # ------------------------------------------------------------------
@@ -329,6 +426,7 @@ class DROIDInferenceRunner:
         n_stale: int,
         latencies: List[float],
         embeddings: Optional[np.ndarray] = None,
+        n_warmup_steps: int = 0,
     ) -> EpisodeRecord:
         avg_lat = float(np.mean(latencies)) if latencies else 0.0
         return EpisodeRecord(
@@ -341,4 +439,5 @@ class DROIDInferenceRunner:
             avg_chunk_latency_ms=avg_lat,
             chunk_latencies_ms=list(latencies),
             embeddings=embeddings,
+            n_warmup_steps=n_warmup_steps,
         )

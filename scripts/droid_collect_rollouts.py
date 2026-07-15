@@ -254,6 +254,22 @@ def main() -> None:
                         help="Number of steps to stay in warmup mode (default 1s at 15Hz).")
     parser.add_argument("--max-timesteps", type=int, default=600)
     parser.add_argument("--control-hz", type=float, default=15.0)
+    parser.add_argument("--policy-hz", type=float, default=None,
+                         help="async_streaming only: caps how often the background "
+                              "thread re-submits inference, decoupled from --control-hz. "
+                              "Unset re-submits back-to-back, as fast as the policy allows.")
+    parser.add_argument("--min-commit-steps", type=int, default=0,
+                         help="async_streaming only: a freshly completed chunk won't "
+                              "preempt the one currently executing until at least this "
+                              "many of its steps have run. Bounds worst-case plan churn "
+                              "regardless of inference-timing jitter (0 — default — "
+                              "preempts as soon as a new chunk is ready).")
+    parser.add_argument("--replan-step", type=int, default=0,
+                         help="async_chunk only: submit inference for the next chunk on "
+                              "this step index of the current chunk instead of the start "
+                              "(0 — default). Clamped to the chunk's last step if the "
+                              "chunk is shorter. Delaying gives the policy a fresher "
+                              "observation at the cost of less background inference time.")
     parser.add_argument("--action-space", default="joint_velocity",
                         choices=["joint_velocity", "cartesian_velocity", "joint_position"],
                         help="Action space the policy was trained with.")
@@ -298,6 +314,9 @@ def main() -> None:
         warmup_horizon=args.warmup_horizon,
         max_timesteps=args.max_timesteps,
         control_hz=args.control_hz,
+        policy_hz=args.policy_hz,
+        min_commit_steps=args.min_commit_steps,
+        replan_step=args.replan_step,
     )
 
     use_tty = sys.stdin.isatty()
@@ -325,6 +344,11 @@ def main() -> None:
             listener.join(timeout=0.3)  # wait for raw-mode cleanup before prompt
 
         episode_data = env.pop_episode_data()
+        if record.n_warmup_steps:
+            # Steps taken before the first policy result arrived (streaming
+            # mode only) have no embedding — drop them so the persisted
+            # trajectory stays aligned with record.embeddings.
+            episode_data = episode_data[record.n_warmup_steps:]
         env.reset()  # reset immediately so robot goes home while user labels
 
         tracking_fig = None
