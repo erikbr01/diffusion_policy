@@ -56,6 +56,7 @@ class RobomimicReplayLowdimDataset(BaseLowdimDataset):
         holdout_selection_config: Optional[str] = None,
         sample_mask_drop_threshold: float = 1.0,
         verify_curation_dataset_identity: bool = True,
+        sample_weights_path: Optional[str] = None,
     ):
         obs_keys = list(obs_keys)
         rotation_transformer = RotationTransformer(
@@ -160,6 +161,33 @@ class RobomimicReplayLowdimDataset(BaseLowdimDataset):
             sample_mask_drop_threshold=sample_mask_drop_threshold,
         )
 
+        # Weighted BC: per-step scores (aligned to the concatenated replay
+        # buffer, i.e. demos in numeric order) -> one weight per train
+        # sequence, consumed by the workspace via WeightedRandomSampler.
+        self.sample_weights = None
+        if sample_weights_path is not None:
+            w = np.load(sample_weights_path).astype(np.float64)
+            if len(w) != replay_buffer.n_steps:
+                raise ValueError(
+                    f"sample_weights_path {sample_weights_path!r} has {len(w)} "
+                    f"entries but the replay buffer has {replay_buffer.n_steps} "
+                    "steps (weights must align with demos in numeric order)"
+                )
+            if not np.isfinite(w).all() or (w < 0).any():
+                raise ValueError("sample weights must be finite and >= 0")
+            seq_w = np.array(
+                [w[s:e].mean() for s, e in sampler.indices[:, :2]], dtype=np.float64
+            )
+            total = seq_w.sum()
+            if total <= 0:
+                raise ValueError("all sequence weights are zero")
+            ess = total**2 / (len(seq_w) * np.square(seq_w).sum())
+            print(
+                f"[WeightedBC] {sample_weights_path}: {len(seq_w)} train sequences, "
+                f"ESS={ess:.3f}, zero_frac={(seq_w == 0).mean():.3f}"
+            )
+            self.sample_weights = seq_w
+
         self.replay_buffer = replay_buffer
         self.sampler = sampler
         self.abs_action = abs_action
@@ -187,6 +215,7 @@ class RobomimicReplayLowdimDataset(BaseLowdimDataset):
             episode_mask=self.val_mask,
         )
         val_set.train_mask = self.val_mask
+        val_set.sample_weights = None
         return val_set
 
     def get_holdout_dataset(self):
@@ -199,6 +228,7 @@ class RobomimicReplayLowdimDataset(BaseLowdimDataset):
             episode_mask=self.holdout_mask,
         )
         holdout_set.train_mask = self.holdout_mask
+        holdout_set.sample_weights = None
         return holdout_set
 
     def get_normalizer(self, **kwargs) -> LinearNormalizer:
