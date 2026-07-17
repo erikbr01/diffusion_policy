@@ -77,7 +77,8 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
             abs_action=False,
             tqdm_interval_sec=5.0,
             n_envs=None,
-            save_episodes=False
+            save_episodes=False,
+            record_cadence="policy"
         ):
         """
         Assuming:
@@ -254,6 +255,22 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
 
         # save episodes (multi-env supported: per-env buffers, global episode
         # indexing — same scheme as MimicgenLowdimRunner)
+        #
+        # record_cadence:
+        #   'policy' (default) — one record per policy inference call, storing
+        #       the obs window and the full predicted action plan (one chunk of
+        #       n_action_steps executed env steps per record).
+        #   'env' — one record per executed env step, storing the low-dim state
+        #       BEFORE the action executes and the executed action itself (in
+        #       policy action space, pre-undo_transform). The chunk is stepped
+        #       one action at a time so per-step observations are visible; the
+        #       first record of each chunk additionally carries the policy-call
+        #       context ('policy_obs_window', 'policy_action_plan').
+        if record_cadence not in ("policy", "env"):
+            raise ValueError(f"record_cadence must be 'policy' or 'env', got {record_cadence!r}")
+        if record_cadence == "env" and not save_episodes:
+            raise ValueError("record_cadence='env' requires save_episodes=True")
+        self.record_cadence = record_cadence
         self.save_episodes = save_episodes
         self.n_test_vis = n_test_vis
         self.episode_dir = None
@@ -306,6 +323,10 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
                 env_episode_data = [[] for _ in range(this_n_active_envs)]
                 env_done_flags = [False] * this_n_active_envs
                 env_timesteps = [0] * this_n_active_envs
+                # per-env 'done ever' flag from env.step returns (truncation /
+                # inner-env done); only consulted at env-step cadence, where the
+                # wrapper drops post-done actions mid-chunk
+                env_step_done = np.zeros(this_n_active_envs, dtype=bool)
 
             # start rollout
             obs = env.reset()
@@ -351,16 +372,17 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
                         raise ValueError(f"Actions for policy {type(policy)} cannot be retrieved.")
                     frames = (env.call("_render_frame", "rgb_array")
                               if self.n_test_vis > 0 else None)
-                    for env_i in range(this_n_active_envs):
-                        if not env_done_flags[env_i]:
-                            env_episode_data[env_i].append({
-                                "idx": env_timesteps[env_i],
-                                "episode": ep_abs_idx + env_i,
-                                "timestep": env_timesteps[env_i],
-                                "obs": np_obs_dict["obs"][env_i].copy().astype(np.float32),
-                                "img": frames[env_i] if frames is not None else None,
-                                "action": actions_np[env_i].copy().astype(np.float32),
-                            })
+                    if self.record_cadence == "policy":
+                        for env_i in range(this_n_active_envs):
+                            if not env_done_flags[env_i]:
+                                env_episode_data[env_i].append({
+                                    "idx": env_timesteps[env_i],
+                                    "episode": ep_abs_idx + env_i,
+                                    "timestep": env_timesteps[env_i],
+                                    "obs": np_obs_dict["obs"][env_i].copy().astype(np.float32),
+                                    "img": frames[env_i] if frames is not None else None,
+                                    "action": actions_np[env_i].copy().astype(np.float32),
+                                })
 
                 # handle latency_steps, we discard the first n_latency_steps actions
                 # to simulate latency
@@ -368,13 +390,54 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
                 if not np.all(np.isfinite(action)):
                     print(action)
                     raise RuntimeError("Nan or Inf action")
-                
+
                 # step env
                 env_action = action
                 if self.abs_action:
                     env_action = self.undo_transform_action(action)
 
-                obs, reward, done, info = env.step(env_action)
+                if self.save_episodes and self.record_cadence == "env":
+                    # Env-step cadence: execute the chunk one action at a time
+                    # so every per-step observation is visible. MultiStepWrapper
+                    # aggregates reward/done over episode-long lists and drops
+                    # post-done actions, so splitting the chunk into
+                    # single-action step() calls leaves env semantics unchanged.
+                    cur_state = np.asarray(obs)[:, -1]
+                    for i in range(env_action.shape[1]):
+                        for env_i in range(this_n_active_envs):
+                            if env_done_flags[env_i] or env_step_done[env_i]:
+                                continue
+                            env_episode_data[env_i].append({
+                                "idx": env_timesteps[env_i],
+                                "episode": ep_abs_idx + env_i,
+                                "timestep": env_timesteps[env_i],
+                                # low-dim state BEFORE this action executes
+                                # (same alignment as policy cadence: the state
+                                # at the moment the action is applied)
+                                "obs": cur_state[env_i].copy().astype(np.float32),
+                                "img": (frames[env_i]
+                                        if frames is not None and i == 0 else None),
+                                # executed action in policy action space
+                                # (pre-undo_transform), matching what
+                                # plan[executed_action_index] yields at policy
+                                # cadence
+                                "action": action[env_i, i].copy().astype(np.float32),
+                                # policy-call context on the chunk's first step
+                                # only (one inference per chunk); consumed for
+                                # policy-cadence embedding extraction
+                                "policy_obs_window": (
+                                    np_obs_dict["obs"][env_i].copy().astype(np.float32)
+                                    if i == 0 else None),
+                                "policy_action_plan": (
+                                    actions_np[env_i].copy().astype(np.float32)
+                                    if i == 0 else None),
+                            })
+                            env_timesteps[env_i] += 1
+                        obs, reward, done, info = env.step(env_action[:, i:i + 1])
+                        cur_state = np.asarray(obs)[:, -1]
+                        env_step_done |= np.asarray(done, dtype=bool)[:this_n_active_envs]
+                else:
+                    obs, reward, done, info = env.step(env_action)
                 done = np.all(done)
 
                 # per-env success tracking; terminate the chunk once every env
@@ -388,9 +451,10 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
 
                 past_action = action
 
-                # update pbar and per-env timestep counters
+                # update pbar and per-env timestep counters (at env cadence the
+                # counters are advanced per executed step in the loop above)
                 pbar.update(action.shape[1])
-                if self.save_episodes:
+                if self.save_episodes and self.record_cadence == "policy":
                     for env_i in range(this_n_active_envs):
                         if not env_done_flags[env_i]:
                             env_timesteps[env_i] += action.shape[1]
@@ -468,6 +532,7 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
                 "length": int(sum(episode_lengths)),
                 "episode_lengths": [int(x) for x in episode_lengths],
                 "episode_successes": [bool(x) for x in episode_successes],
+                "record_cadence": self.record_cadence,
             }
             with open(self.episode_dir / "metadata.yaml", "w") as f:
                 yaml.safe_dump(metadata, f)
