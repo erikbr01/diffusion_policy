@@ -102,8 +102,15 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
         # robo_dataset-backed datasets need per-worker store re-init after fork
         worker_init_fn = getattr(dataset, "dataloader_worker_init_fn", None)
 
-        # train dataloader: DistributedSampler for DDP, standard otherwise
+        # train dataloader: DistributedSampler for DDP, standard otherwise;
+        # score-weighted sampling when the dataset carries sample_weights
+        sample_weights = getattr(dataset, "sample_weights", None)
         if world_size > 1:
+            if sample_weights is not None:
+                raise NotImplementedError(
+                    "weighted BC sampling (task.dataset.sample_weights_path) "
+                    "is single-GPU only; run with num_gpus=1"
+                )
             from torch.utils.data.distributed import DistributedSampler
             train_sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
             train_dl_kw = {k: v for k, v in cfg.dataloader.items() if k != "shuffle"}
@@ -113,7 +120,18 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
             train_dl_kw = dict(cfg.dataloader)
             if device.type == "mps":
                 train_dl_kw["pin_memory"] = False
-            train_dataloader = DataLoader(dataset, worker_init_fn=worker_init_fn, **train_dl_kw)
+            if sample_weights is not None:
+                from torch.utils.data import WeightedRandomSampler
+                weighted_sampler = WeightedRandomSampler(
+                    weights=torch.as_tensor(sample_weights, dtype=torch.double),
+                    num_samples=len(dataset),
+                    replacement=True,
+                )
+                train_dl_kw.pop("shuffle", None)
+                train_dataloader = DataLoader(dataset, sampler=weighted_sampler,
+                    worker_init_fn=worker_init_fn, **train_dl_kw)
+            else:
+                train_dataloader = DataLoader(dataset, worker_init_fn=worker_init_fn, **train_dl_kw)
 
         normalizer = dataset.get_normalizer()
 

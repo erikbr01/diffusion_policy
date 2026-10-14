@@ -28,6 +28,17 @@ the observation window and the full predicted action plan. Episode lengths in
 ``metadata.yaml`` count those rows, and one embedding is extracted per row, so
 embeddings align 1:1 with the episode sample ranges.
 
+``--record-cadence env`` (low-dim robomimic runner only; default ``policy`` is
+the behavior above) switches to full env-step recording: the runner executes
+each predicted chunk one action at a time and records, per executed env step,
+the low-dim state before the action and the action itself, so
+``observations/state.npz`` and ``actions.npz`` have one row per env step and
+``metadata.yaml`` lengths count env steps. The policy still runs only once per
+``n_action_steps`` chunk, so per-env-step embeddings do not exist; embeddings
+are extracted once per policy call and stored under
+``policy_embeddings/<layer>_policycadence.npz``, with per-episode call counts
+and an explanatory note recorded in ``episodes/metadata.yaml``.
+
 Embedding layer names are documented in
 ``diffusion_policy/common/policy_embeddings.py`` (the shared extraction
 machinery). The default ``bottleneck_plan_t0`` conditions the UNet bottleneck
@@ -45,13 +56,14 @@ Usage (from the repo root, in the sim conda env):
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import logging
 import pathlib
 import pickle
 import shutil
 import sys
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -105,12 +117,31 @@ def resolve_checkpoint(path: pathlib.Path) -> pathlib.Path:
 # ---------------------------------------------------------------------------
 
 def _episode_records(pkl_path: pathlib.Path) -> list:
-    """Load one episode's per-inference-step records (DataFrame or list of dicts)."""
+    """Load one episode's recorded step records (DataFrame or list of dicts)."""
     with open(pkl_path, "rb") as f:
         data = pickle.load(f)
     if hasattr(data, "iloc"):
         return [data.iloc[t] for t in range(len(data))]
     return list(data)
+
+
+def _policy_call_rows(records: list) -> list:
+    """Rows of an env-cadence episode that carry the policy-call context.
+
+    At env cadence the runner attaches ``policy_obs_window`` /
+    ``policy_action_plan`` to the first recorded step of each executed action
+    chunk (one policy inference per chunk); all other rows carry None there.
+    """
+    rows = []
+    for row in records:
+        try:
+            plan = row["policy_action_plan"]
+        except (KeyError, IndexError):
+            continue
+        if plan is None or (isinstance(plan, float) and np.isnan(plan)):
+            continue
+        rows.append(row)
+    return rows
 
 
 def extract_embeddings(
@@ -120,8 +151,15 @@ def extract_embeddings(
     lengths: List[int],
     batch_size: int,
     device: torch.device,
-) -> np.ndarray:
-    """Extract one embedding per recorded inference step across all episodes."""
+    record_cadence: str = "policy",
+) -> Tuple[np.ndarray, List[int]]:
+    """Extract one embedding per policy inference call across all episodes.
+
+    Returns ``(embeddings, per-episode inference-call counts)``. At policy
+    cadence every recorded row is an inference call, so counts == lengths; at
+    env cadence only the rows carrying ``policy_action_plan`` are (one per
+    executed action chunk), and embeddings are policy-cadence by construction.
+    """
     extractor = PolicyEmbeddingExtractor(policy, layer, device)
 
     pkls = sorted(episodes_dir.glob("ep*.pkl"))
@@ -130,23 +168,35 @@ def extract_embeddings(
             f"{len(pkls)} episode pickles but metadata lists {len(lengths)} episodes"
         )
 
-    all_obs, all_actions = [], []
+    all_obs, all_actions, call_counts = [], [], []
     for pkl_path, ep_len in zip(pkls, lengths):
         records = _episode_records(pkl_path)
         if len(records) != ep_len:
             raise RuntimeError(
                 f"{pkl_path.name} has {len(records)} records but metadata says {ep_len}"
             )
-        for row in records:
+        if record_cadence == "env":
+            rows = _policy_call_rows(records)
+            if not rows:
+                raise RuntimeError(
+                    f"{pkl_path.name} has no policy-call rows; was it recorded "
+                    f"with --record-cadence env?"
+                )
+            obs_key, action_key = "policy_obs_window", "policy_action_plan"
+        else:
+            rows = records
+            obs_key, action_key = "obs", "action"
+        call_counts.append(len(rows))
+        for row in rows:
             if extractor.obs_is_dict:
                 all_obs.append(
-                    {k: np.asarray(v, dtype=np.float32) for k, v in row["obs"].items()}
+                    {k: np.asarray(v, dtype=np.float32) for k, v in row[obs_key].items()}
                 )
             else:
-                obs = np.asarray(row["obs"], dtype=np.float32)
+                obs = np.asarray(row[obs_key], dtype=np.float32)
                 all_obs.append(obs[np.newaxis, :] if obs.ndim == 1 else obs)
             if extractor.needs_actions:
-                all_actions.append(np.asarray(row["action"], dtype=np.float32))
+                all_actions.append(np.asarray(row[action_key], dtype=np.float32))
 
     action_arr = np.stack(all_actions, axis=0) if extractor.needs_actions else None
     n_total = len(all_obs)
@@ -163,7 +213,7 @@ def extract_embeddings(
                 batch_seed=start,
             )
         )
-    return np.concatenate(results, axis=0)
+    return np.concatenate(results, axis=0), call_counts
 
 
 # ---------------------------------------------------------------------------
@@ -204,8 +254,14 @@ def extract_states_and_actions(
     episodes_dir: pathlib.Path,
     lengths: List[int],
     n_latency_steps: int,
+    record_cadence: str = "policy",
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Per recorded step: the flattened low-dim state + the first executed action."""
+    """Per recorded step: the flattened low-dim state + the executed action.
+
+    At policy cadence each row stores the full predicted plan, so the executed
+    action is ``plan[executed_action_index]``; at env cadence each row already
+    stores exactly the one action executed at that env step.
+    """
     obs_is_dict = isinstance(
         policy, (DiffusionUnetHybridImagePolicy, DiffusionTransformerHybridImagePolicy)
     )
@@ -226,8 +282,8 @@ def extract_states_and_actions(
             )
         for row in records:
             states.append(_state_vector(row["obs"], obs_is_dict))
-            plan = np.asarray(row["action"], dtype=np.float32)
-            actions.append(plan[exec_idx])
+            act = np.asarray(row["action"], dtype=np.float32)
+            actions.append(act if record_cadence == "env" else act[exec_idx])
     return (
         np.stack(states, axis=0).astype(np.float32),
         np.stack(actions, axis=0).astype(np.float32),
@@ -247,7 +303,12 @@ def _read_native_metadata(episodes_dir: pathlib.Path) -> Tuple[List[int], List[b
 
 
 def _write_canonical_metadata(
-    episodes_dir: pathlib.Path, lengths: List[int], successes: List[bool]
+    episodes_dir: pathlib.Path,
+    lengths: List[int],
+    successes: List[bool],
+    record_cadence: str = "policy",
+    policy_call_counts: Optional[List[int]] = None,
+    embedding_layer: Optional[str] = None,
 ) -> None:
     metadata = {
         "episodes": [
@@ -255,6 +316,20 @@ def _write_canonical_metadata(
             for i, (n, s) in enumerate(zip(lengths, successes))
         ]
     }
+    if record_cadence != "policy":
+        metadata["record_cadence"] = record_cadence
+        metadata["policy_embeddings"] = {
+            "cadence": "policy",
+            "layer_file": f"{embedding_layer}.npz",
+            "episode_policy_calls": [int(x) for x in (policy_call_counts or [])],
+            "note": (
+                "state.npz/actions.npz rows are per executed env step, but the "
+                "policy runs only once per n_action_steps chunk, so per-env-step "
+                "embeddings do not exist; embeddings are stored at policy-call "
+                "cadence under the *_policycadence layer, aligned per episode by "
+                "episode_policy_calls."
+            ),
+        }
     with open(episodes_dir / "metadata.yaml", "w") as f:
         yaml.safe_dump(metadata, f, sort_keys=False)
 
@@ -298,6 +373,12 @@ def main() -> None:
     parser.add_argument("--runner-set", action="append", default=[],
                         help="key=value override applied to the env runner cfg (repeatable), "
                              "e.g. --runner-set env_name=PickPlaceCounterToCabinet")
+    parser.add_argument("--record-cadence", choices=("policy", "env"), default="policy",
+                        help="'policy' (default): one recorded row per policy inference "
+                             "call (current behavior). 'env': one row per executed env "
+                             "step — state.npz/actions.npz and metadata lengths are "
+                             "env-step; embeddings stay at policy cadence under "
+                             "<layer>_policycadence (low-dim robomimic runner only).")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch-size", type=int, default=128,
                         help="Batch size for embedding extraction.")
@@ -352,11 +433,18 @@ def main() -> None:
         from omegaconf import OmegaConf as _OC
         _OC.update(runner_cfg, key, yaml.safe_load(value), force_add=True)
 
-    env_runner = hydra.utils.instantiate(
-        runner_cfg, output_dir=str(output_dir), save_episodes=True
-    )
+    runner_kwargs = dict(output_dir=str(output_dir), save_episodes=True)
+    if args.record_cadence != "policy":
+        runner_cls = hydra.utils.get_class(runner_cfg._target_)
+        if "record_cadence" not in inspect.signature(runner_cls.__init__).parameters:
+            raise SystemExit(
+                f"--record-cadence={args.record_cadence} is not supported by "
+                f"{runner_cfg._target_}; only runners with a record_cadence "
+                f"parameter (robomimic low-dim) can record at env-step cadence"
+            )
+        runner_kwargs["record_cadence"] = args.record_cadence
+    env_runner = hydra.utils.instantiate(runner_cfg, **runner_kwargs)
     logger.info("running %d episodes (seed=%d)", args.num_episodes, args.seed)
-    import inspect
 
     if "policy_cfg" in inspect.signature(env_runner.run).parameters:
         # The robocasa runner re-instantiates the policy in eval subprocesses.
@@ -370,21 +458,34 @@ def main() -> None:
 
     episodes_dir = output_dir / "episodes"
     lengths, successes = _read_native_metadata(episodes_dir)
-    embeddings = extract_embeddings(
-        policy, episodes_dir, args.layer, lengths, args.batch_size, device
+    embeddings, policy_call_counts = extract_embeddings(
+        policy, episodes_dir, args.layer, lengths, args.batch_size, device,
+        record_cadence=args.record_cadence,
     )
-    if embeddings.shape[0] != sum(lengths):
+    if embeddings.shape[0] != sum(policy_call_counts):
         raise RuntimeError(
-            f"{embeddings.shape[0]} embeddings but episode lengths sum to {sum(lengths)}"
+            f"{embeddings.shape[0]} embeddings but policy-call counts sum to "
+            f"{sum(policy_call_counts)}"
         )
 
+    emb_layer = (
+        args.layer if args.record_cadence == "policy"
+        else f"{args.layer}_policycadence"
+    )
+    if args.record_cadence != "policy":
+        logger.info(
+            "env-step cadence: per-step embeddings unavailable (one inference per "
+            "chunk); storing %d policy-cadence embeddings as layer %s",
+            embeddings.shape[0], emb_layer,
+        )
     emb_dir = output_dir / "policy_embeddings"
     emb_dir.mkdir(exist_ok=True)
-    np.savez_compressed(emb_dir / f"{args.layer}.npz", embeddings=embeddings)
+    np.savez_compressed(emb_dir / f"{emb_layer}.npz", embeddings=embeddings)
 
     n_latency_steps = int(runner_cfg.get("n_latency_steps", 0) or 0)
     states, exec_actions = extract_states_and_actions(
-        policy, episodes_dir, lengths, n_latency_steps
+        policy, episodes_dir, lengths, n_latency_steps,
+        record_cadence=args.record_cadence,
     )
     if states.shape[0] != sum(lengths):
         raise RuntimeError(
@@ -396,7 +497,12 @@ def main() -> None:
     np.savez_compressed(output_dir / "actions.npz", actions=exec_actions)
     logger.info("wrote state %s and executed actions %s", states.shape, exec_actions.shape)
 
-    _write_canonical_metadata(episodes_dir, lengths, successes)
+    _write_canonical_metadata(
+        episodes_dir, lengths, successes,
+        record_cadence=args.record_cadence,
+        policy_call_counts=policy_call_counts,
+        embedding_layer=emb_layer,
+    )
     _rename_media(output_dir / "media")
     logger.info(
         "done: %d episodes, %d/%d successes, embeddings %s",
